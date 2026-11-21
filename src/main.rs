@@ -52,12 +52,21 @@ impl Registers {
 }
 
 // ---------- 64KB 总线 ----------
-// 真机上不同地址段通向不同硬件。本批接两样：
-//   · 卡带 ROM（0x0000~0x7FFF）：只读，写进去会被忽略（真机靠 MBC 芯片换页，先不管）
-//   · 串口（0xFF01 数据 / 0xFF02 控制）：Blargg 考卷用它打印成绩单！
+// 真机上不同地址段通向不同硬件。本批接三样：
+//   · 卡带 ROM（0x0000~0x7FFF）：经 MBC 芯片换页（bank 切进 0x4000~0x7FFF 窗口）
+//   · SRAM 存档（0xA000~0xBFFF）：卡带自带可写内存，纽扣电池供电，得先「开锁」才读写
+//   · 串口（0xFF01 数据 / 0xFF02 控制）：Blargg / Mooneye 考卷用它打印成绩单！
 //     往 FF02 写 0x81 = 「把 FF01 里的字符发出去」，我们把它收进字符串。
 pub struct Bus {
     pub mem: Vec<u8>,
+    pub cart: Vec<u8>,        // 完整卡带 ROM（含 MBC 换页的全部 bank）
+    pub ram: Vec<u8>,         // SRAM 存档（大小由卡带头 0x149 字节定）
+    pub mbc_type: u8,         // 0x147 卡带类型字节
+    pub ramg: bool,           // MBC1 存档「开锁」标志
+    pub bank1: u8,            // 低 5 位 bank 号（写 0x2000~0x3FFF）
+    pub bank2: u8,            // 高 2 位 bank 号（写 0x4000~0x5FFF）
+    pub mode: bool,           // 模式位（写 0x6000~0x7FFF）：true=高级换页
+    pub multicart: bool,      // 是否 multicart（特殊接线）
     pub serial_out: String,   // 考卷成绩单收集处
     pub div_acc: u32,         // DIV 分频累加器（每周期+1，满256归零并让DIV+1）
     pub tac: u8,              // 定时器控制（低3位有效）
@@ -67,34 +76,99 @@ pub struct Bus {
     pub joy_reads: u64,       // 诊断：游戏读了多少次手柄
     pub joy_log: Vec<(u64, u8, u8)>,  // 诊断：(第几次读, 选择位, 返回值) 最近几次
 }
+// 卡带头 0x149 字节 → SRAM 大小（字节）
+fn ram_size_for(header: &[u8]) -> usize {
+    match header.get(0x149).copied().unwrap_or(0) {
+        0x01 => 2048, 0x02 => 8192, 0x03 => 32768, 0x04 => 131_072, 0x05 => 65536, _ => 0
+    }
+}
+// 判断 8Mbit MBC1 multicart：4 个 0x40000 页里 ≥3 页在 0x0104 有相同的任天堂 logo
+fn is_mbc1_multicart(cart: &[u8]) -> bool {
+    if cart.len() != 0x100000 { return false; }
+    let logo0 = &cart[0x104..0x134];
+    let mut count = 0;
+    for page in 0..4 {
+        let start = page * 0x40000 + 0x104;
+        if &cart[start..start + 0x30] == logo0 { count += 1; }
+    }
+    count >= 3
+}
 impl Bus {
     pub fn new() -> Self {
-        let mut b = Bus { mem: vec![0; 0x10000], serial_out: String::new(), div_acc: 0, tac: 0, tima_acc: 0, joypad_dir: 0x0F, joypad_btn: 0x0F, joy_reads: 0, joy_log: Vec::new() };
+        let mut b = Bus {
+            mem: vec![0; 0x10000],
+            cart: Vec::new(), ram: Vec::new(), mbc_type: 0,
+            ramg: false, bank1: 1, bank2: 0, mode: false, multicart: false,
+            serial_out: String::new(), div_acc: 0, tac: 0, tima_acc: 0,
+            joypad_dir: 0x0F, joypad_btn: 0x0F, joy_reads: 0, joy_log: Vec::new(),
+        };
         b.mem[0xFF44] = 0x00;   // LY：现在由 PPU 真正驱动，不再谎报
         b
     }
     pub fn read(&mut self, addr: u16) -> u8 {
-        if addr == 0xFF00 {
-            // Joypad 读：bit4/5 是选择线（0=选中），返回低4位按键状态（0=按下）
-            let sel = self.mem[0xFF00];
-            let mut result = 0x0F;   // 默认全没按
-            if sel & 0x20 == 0 {
-                // 选中方向键（P15）：右左上下 → bit0~3
-                result &= self.joypad_dir;
+        match addr {
+            0x0000..=0x7FFF => self.read_rom(addr),
+            0xA000..=0xBFFF => self.read_ram(addr),
+            0xFF00 => {
+                // Joypad 读：bit4/5 是选择线（0=选中），返回低4位按键状态（0=按下）
+                let sel = self.mem[0xFF00];
+                let mut result = 0x0F;   // 默认全没按
+                if sel & 0x20 == 0 {
+                    // 选中方向键（P15）：右左上下 → bit0~3
+                    result &= self.joypad_dir;
+                }
+                if sel & 0x10 == 0 {
+                    // 选中功能键（P14）：Select Start B A → bit3~0（注意顺序）
+                    result &= self.joypad_btn;
+                }
+                let r = (sel & 0x30) | result | 0xC0;   // 高2位恒1
+                self.joy_reads += 1;
+                if self.joy_log.len() < 40 { self.joy_log.push((self.joy_reads, sel, r)); }
+                r
             }
-            if sel & 0x10 == 0 {
-                // 选中功能键（P14）：Select Start B A → bit3~0（注意顺序）
-                result &= self.joypad_btn;
-            }
-            let r = (sel & 0x30) | result | 0xC0;   // 高2位恒1
-            self.joy_reads += 1;
-            if self.joy_log.len() < 40 { self.joy_log.push((self.joy_reads, sel, r)); }
-            return r;
+            _ => self.mem[addr as usize],
         }
-        self.mem[addr as usize]
+    }
+    // MBC1 换页核心：算「低 bank」和「高 bank」两个窗口各落在 ROM 的哪个偏移
+    fn rom_offsets(&self) -> (usize, usize) {
+        let upper_bits = if self.multicart { (self.bank2 as usize) << 4 } else { (self.bank2 as usize) << 5 };
+        let lower_bits = if self.multicart { (self.bank1 & 0x0F) as usize } else { self.bank1 as usize };
+        let lower_bank = if self.mode { upper_bits } else { 0 };   // mode=1 时低窗口也能被 bank2 顶走
+        let upper_bank = upper_bits | lower_bits;
+        (0x4000 * lower_bank, 0x4000 * upper_bank)
+    }
+    fn read_rom(&self, addr: u16) -> u8 {
+        if self.cart.is_empty() { return 0xFF; }
+        let (lo, hi) = self.rom_offsets();
+        let base = if addr < 0x4000 { lo } else { hi };
+        let off = base | (addr as usize & 0x3FFF);
+        self.cart[off & (self.cart.len() - 1)]
+    }
+    fn ram_addr(&self, addr: u16) -> usize {
+        let off = if self.mode { (self.bank2 as usize) * 0x2000 } else { 0 };
+        (off | (addr as usize & 0x1FFF)) & (self.ram.len() - 1)
+    }
+    fn read_ram(&self, addr: u16) -> u8 {
+        if self.ram.is_empty() || !self.ramg { return 0xFF; }   // 没开锁读到的就是垃圾
+        self.ram[self.ram_addr(addr)]
+    }
+    fn write_ram(&mut self, addr: u16, val: u8) {
+        if !self.ram.is_empty() && self.ramg {
+            let idx = self.ram_addr(addr);
+            self.ram[idx] = val;
+        }
     }
     pub fn write(&mut self, addr: u16, val: u8) {
-        if addr < 0x8000 { return; }   // 卡带区只读
+        // 卡带区写入 = MBC 命令（不是真往 ROM 写，是给换页芯片下指令）
+        let is_mbc1 = matches!(self.mbc_type, 0x01 | 0x02 | 0x03);
+        match addr {
+            0x0000..=0x1FFF => { if is_mbc1 { self.ramg = val & 0x0F == 0x0A; } return; }  // RAM 使能：低4位=0xA 开锁
+            0x2000..=0x3FFF => { if is_mbc1 { self.bank1 = val & 0x1F; if self.bank1 == 0 { self.bank1 = 1; } } return; }  // 低5位 bank，0 强制为 1
+            0x4000..=0x5FFF => { if is_mbc1 { self.bank2 = val & 0x03; } return; }        // 高2位 bank
+            0x6000..=0x7FFF => { if is_mbc1 { self.mode = val & 1 != 0; } return; }       // 模式位
+            0xA000..=0xBFFF => { self.write_ram(addr, val); return; }                     // SRAM 写（要开锁）
+            _ => {}
+        }
         match addr {
             0xFF04 => { self.mem[0xFF04] = 0; self.div_acc = 0; return; }  // 写DIV=清零
             0xFF05 => { self.mem[0xFF05] = val; return; }                  // TIMA 直接写
@@ -106,7 +180,7 @@ impl Bus {
             0xFF46 => {                                                    // DMA：把 XX00~XX9F 搬到 OAM
                 let src = (val as u16) << 8;
                 for i in 0..0xA0u16 {
-                    let v = self.mem[(src + i) as usize];
+                    let v = self.read(src + i);                            // 走 read() 让 ROM 区也能正确取到卡带
                     self.mem[0xFE00 + i as usize] = v;
                 }
                 return;
@@ -152,10 +226,25 @@ impl Bus {
         self.write(addr, val as u8);
         self.write(addr.wrapping_add(1), (val >> 8) as u8);
     }
-    // 装卡带：ROM 拷进低 32KB
+    // 装卡带：完整 ROM 存进 cart，按头部字节初始化 MBC 状态与 SRAM 大小
     pub fn load_rom(&mut self, rom: &[u8]) {
-        let n = rom.len().min(0x8000);
-        self.mem[..n].copy_from_slice(&rom[..n]);
+        self.cart = rom.to_vec();
+        self.mbc_type = rom.get(0x147).copied().unwrap_or(0);
+        self.ram = vec![0; ram_size_for(rom)];
+        self.ramg = false;
+        self.bank1 = 1;
+        self.bank2 = 0;
+        self.mode = false;
+        self.multicart = is_mbc1_multicart(&self.cart);
+    }
+    // 把 SRAM 存档落盘为 .sav 文件（测试后调用验证持久化）
+    pub fn save_sram(&self, path: &str) -> std::io::Result<()> {
+        std::fs::write(path, &self.ram)
+    }
+    pub fn load_sram(&mut self, path: &str) -> std::io::Result<()> {
+        let data = std::fs::read(path)?;
+        if data.len() == self.ram.len() { self.ram.copy_from_slice(&data); }
+        Ok(())
     }
 }
 
@@ -168,11 +257,12 @@ pub struct Cpu {
     pub ime: bool,        // 中断总开关（EI/DI 改它，中断本身下批做）
     pub cycles: u64,
     pub unknown: Vec<(u8, u16)>,   // 未实现指令记录（去重），考完对答案用
+    pub mooneye_result: Option<u8>,  // Mooneye 测试结果：执行 0x40(magic_breakpoint) 时 B=3 过 / 0x42 挂
 }
 
 impl Cpu {
     pub fn new() -> Self {
-        Cpu { reg: Registers::new(), pc: 0x0100, sp: 0xFFFE, halted: false, ime: false, cycles: 0, unknown: Vec::new() }
+        Cpu { reg: Registers::new(), pc: 0x0100, sp: 0xFFFE, halted: false, ime: false, cycles: 0, unknown: Vec::new(), mooneye_result: None }
     }
 
     fn fetch8(&mut self, bus: &mut Bus) -> u8 {
@@ -361,6 +451,11 @@ impl Cpu {
             return 4 + t;
         }
         let op = self.fetch8(bus);
+        // Mooneye 测试的 magic_breakpoint = 0x40 (LD B,B)。执行它时 B 已装好结果：
+        // 3=通过，0x42=失败。抓到就记下，供验收测试判定。
+        if op == 0x40 && self.mooneye_result.is_none() {
+            self.mooneye_result = Some(self.reg.b);
+        }
         let t = match op {
             0x00 => 4,                                       // NOP
             0x10 => { let _ = self.fetch8(bus); 4 }          // STOP：考卷用它在失败处刹车，先当2字节NOP
@@ -709,12 +804,13 @@ fn main() {
     // 演示：CALL/RET 子程序 —— 你的 2nnn/00EE 在 GameBoy 上复活
     let mut bus = Bus::new();
     let mut cpu = Cpu::new();
+    bus.cart = vec![0; 0x8000];   // 无 MBC 卡带：程序写进 cart
     // 0x0100: LD A,10 / LD B,5 / CALL 0x0150 / HALT
     let main_prog: [u8; 8] = [0x3E, 10, 0x06, 5, 0xCD, 0x50, 0x01, 0x76];
-    bus.mem[0x0100..0x0108].copy_from_slice(&main_prog);
+    bus.cart[0x0100..0x0108].copy_from_slice(&main_prog);
     // 0x0150: ADD A,B / RET（子程序：把 B 加进 A 再回家）
-    bus.mem[0x0150] = 0x80;
-    bus.mem[0x0151] = 0xC9;
+    bus.cart[0x0150] = 0x80;
+    bus.cart[0x0151] = 0xC9;
     while !cpu.halted { cpu.step(&mut bus); }
     println!("A={}（应为15） SP={:04X}（应回FFFE） 周期={}", cpu.reg.a, cpu.sp, cpu.cycles);
 }
@@ -824,7 +920,9 @@ mod tests {
     fn run(program: &[u8], steps: usize) -> (Cpu, Bus) {
         let mut bus = Bus::new();
         let mut cpu = Cpu::new();
-        bus.mem[0x0100..0x0100 + program.len()].copy_from_slice(program);
+        // 无 MBC 卡带：程序写进 cart（前 32KB 现在走 ROM 读取，不再写 mem）
+        bus.cart = vec![0; 0x8000];
+        bus.cart[0x0100..0x0100 + program.len()].copy_from_slice(program);
         for _ in 0..steps { cpu.step(&mut bus); }
         (cpu, bus)
     }
@@ -950,9 +1048,10 @@ mod tests {
         // 主程序 CALL 0150，子程序 LD A,99 / RET
         let mut bus = Bus::new();
         let mut cpu = Cpu::new();
+        bus.cart = vec![0; 0x8000];
         let prog = [0xCD, 0x50, 0x01, 0x76];
-        bus.mem[0x0100..0x0104].copy_from_slice(&prog);
-        bus.mem[0x0150] = 0x3E; bus.mem[0x0151] = 99; bus.mem[0x0152] = 0xC9;
+        bus.cart[0x0100..0x0104].copy_from_slice(&prog);
+        bus.cart[0x0150] = 0x3E; bus.cart[0x0151] = 99; bus.cart[0x0152] = 0xC9;
         for _ in 0..10 { if cpu.halted { break; } cpu.step(&mut bus); }
         assert_eq!(cpu.reg.a, 99);
         assert!(cpu.halted);                 // 回到了主程序的 HALT
@@ -962,9 +1061,10 @@ mod tests {
         // 两层嵌套：主→子A(0150)→子B(0160)，验证返程地址层层正确
         let mut bus = Bus::new();
         let mut cpu = Cpu::new();
-        bus.mem[0x0100..0x0104].copy_from_slice(&[0xCD, 0x50, 0x01, 0x76]);
-        bus.mem[0x0150..0x0154].copy_from_slice(&[0xCD, 0x60, 0x01, 0xC9]);
-        bus.mem[0x0160..0x0163].copy_from_slice(&[0x3E, 7, 0xC9]);
+        bus.cart = vec![0; 0x8000];
+        bus.cart[0x0100..0x0104].copy_from_slice(&[0xCD, 0x50, 0x01, 0x76]);
+        bus.cart[0x0150..0x0154].copy_from_slice(&[0xCD, 0x60, 0x01, 0xC9]);
+        bus.cart[0x0160..0x0163].copy_from_slice(&[0x3E, 7, 0xC9]);
         for _ in 0..20 { if cpu.halted { break; } cpu.step(&mut bus); }
         assert_eq!(cpu.reg.a, 7); assert!(cpu.halted); assert_eq!(cpu.sp, 0xFFFE);
     }
@@ -972,9 +1072,10 @@ mod tests {
         // A=1 DEC → Z=1：CALL NZ 不跳（A还是0），CALL Z 跳去把A改88再 RET Z 回来
         let mut bus = Bus::new();
         let mut cpu = Cpu::new();
+        bus.cart = vec![0; 0x8000];
         let prog = [0x3E, 1, 0x3D, 0xC4, 0x60, 0x01, 0xCC, 0x60, 0x01, 0x76];
-        bus.mem[0x0100..0x010A].copy_from_slice(&prog);
-        bus.mem[0x0160..0x0163].copy_from_slice(&[0x3E, 88, 0xC8]);  // LD A,88 / RET Z
+        bus.cart[0x0100..0x010A].copy_from_slice(&prog);
+        bus.cart[0x0160..0x0163].copy_from_slice(&[0x3E, 88, 0xC8]);  // LD A,88 / RET Z
         for _ in 0..20 { if cpu.halted { break; } cpu.step(&mut bus); }
         assert_eq!(cpu.reg.a, 88); assert!(cpu.halted); assert_eq!(cpu.sp, 0xFFFE);
     }
@@ -1053,5 +1154,79 @@ mod tests {
     #[test] fn ld_nn_sp() {
         let (_cpu, mut bus) = run(&[0x08, 0x00, 0xC0], 1);
         assert_eq!(bus.read16(0xC000), 0xFFFE);
+    }
+
+    // ===== MBC1 + SRAM 测试 =====
+    // 造 4 个 16KB bank 的卡带，每个 bank 填不同字节，方便验证换页
+    fn make_cart_4bank() -> Vec<u8> {
+        let mut cart = vec![0u8; 0x10000];   // 64KB = 4 bank
+        for (i, chunk) in cart.chunks_mut(0x4000).enumerate() {
+            let fill = [0xAA, 0xBB, 0xCC, 0xDD][i];
+            for byte in chunk.iter_mut() { *byte = fill; }
+        }
+        cart
+    }
+
+    #[test] fn mbc1_bank_switch() {
+        let mut bus = Bus::new();
+        bus.cart = make_cart_4bank();
+        bus.mbc_type = 0x01;   // MBC1 无 RAM
+        bus.bank1 = 1;
+        assert_eq!(bus.read(0x4000), 0xBB);   // 初始 bank1=1 → 第 1 块
+        bus.write(0x2000, 2);                  // 切 bank2
+        assert_eq!(bus.read(0x4000), 0xCC);
+        bus.write(0x2000, 3);                  // 切 bank3
+        assert_eq!(bus.read(0x4000), 0xDD);
+        bus.write(0x2000, 0);                  // 写 0 强制回 1
+        assert_eq!(bus.read(0x4000), 0xBB);
+        assert_eq!(bus.read(0x0000), 0xAA);   // 低窗口始终 bank0（mode=0）
+    }
+
+    #[test] fn mbc1_ram_enable_and_sram() {
+        let mut bus = Bus::new();
+        bus.cart = make_cart_4bank();
+        bus.mbc_type = 0x03;   // MBC1+RAM+Battery
+        bus.ram = vec![0; 8192];
+        // 未开锁：读 0xA000 得 0xFF，写无效
+        assert_eq!(bus.read(0xA000), 0xFF);
+        bus.write(0xA000, 0x42);
+        assert_eq!(bus.ram[0], 0);
+        // 开锁：写 0x0000=0x0A
+        bus.write(0x0000, 0x0A);
+        bus.write(0xA000, 0x42);
+        assert_eq!(bus.read(0xA000), 0x42);
+        assert_eq!(bus.ram[0], 0x42);
+        // 关锁：写 0x0000=0x00
+        bus.write(0x0000, 0x00);
+        assert_eq!(bus.read(0xA000), 0xFF);
+    }
+
+    // 跑一个 Mooneye ROM 直到触发 magic_breakpoint(0x40)，返回 B 寄存器结果
+    // 成功=Some(3)，失败=Some(0x42)，卡死=None
+    fn run_mooneye(rom_path: &str) -> Option<u8> {
+        let rom = std::fs::read(rom_path).expect("读不到 Mooneye ROM");
+        let mut bus = Bus::new();
+        bus.load_rom(&rom);
+        let mut cpu = Cpu::new();
+        let mut ppu = Ppu::new();
+        for _ in 0..50_000_000u64 {
+            let t = cpu.step(&mut bus);
+            ppu.tick(t, &mut bus);
+            if cpu.mooneye_result.is_some() { break; }
+        }
+        cpu.mooneye_result
+    }
+
+    #[test] fn mooneye_mbc1_all() {
+        let roms = [
+            "bits_bank1.gb", "bits_bank2.gb", "bits_mode.gb", "bits_ramg.gb",
+            "ram_64kb.gb", "ram_256kb.gb", "rom_512kb.gb", "rom_1Mb.gb",
+            "rom_2Mb.gb", "rom_4Mb.gb", "rom_8Mb.gb", "rom_16Mb.gb",
+            "multicart_rom_8Mb.gb",
+        ];
+        for name in roms {
+            let result = run_mooneye(&format!("roms_mbc/{name}"));
+            assert_eq!(result, Some(3), "Mooneye {name} 失败：result={result:?}");
+        }
     }
 }
