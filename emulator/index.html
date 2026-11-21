@@ -215,14 +215,14 @@ class Bus {
 }
 
 class Ppu {
-  constructor(){ this.framebuffer=new Uint8Array(160*144); this.line_cycles=0; this.ly=0; }
+  constructor(){ this.framebuffer=new Uint8Array(160*144); this.line_cycles=0; this.ly=0; this.windowLine=0; }
   tick(t,bus){
     this.line_cycles+=t;
     if(this.line_cycles>=456){
       this.line_cycles-=456;
       this.ly++;
       if(this.ly===144) bus.mem[0xFF0F]|=0x01;
-      else if(this.ly>153) this.ly=0;
+      else if(this.ly>153){ this.ly=0; this.windowLine=0; }
       bus.mem[0xFF44]=this.ly;
       if(this.ly<144){ this.renderLine(bus); this.renderSprites(bus); }
     }
@@ -252,18 +252,27 @@ class Ppu {
     const mapBase=(lcdc&0x08)?0x9C00:0x9800;
     const signed=(lcdc&0x10)===0;
     const bgp=bus.mem[0xFF47];
+    // 窗口层是否在本行生效：开关开 + 窗口顶边 WY <= 当前行
+    const winEnabled=((lcdc&0x20)!==0) && (bus.mem[0xFF4A]<=y);
+    const wx=bus.mem[0xFF4B];
+    const winMapBase=(lcdc&0x40)?0x9C00:0x9800;
     for(let x=0;x<160;x++){
-      const mapX=((x+scx)&255)>>3, mapY=((y+scy)&255)>>3;
-      const tileNum=bus.mem[mapBase+mapY*32+mapX];
+      // 判断这一列属于窗口层还是背景层（WX 存的是真实左边沿+7）
+      let tmBase, tileY, offX;
+      if(winEnabled && x+7>=wx){ tmBase=winMapBase; tileY=this.windowLine; offX=x+7-wx; }
+      else { tmBase=mapBase; tileY=(y+scy)&255; offX=(x+scx)&255; }
+      const mapX=offX>>3, mapY=tileY>>3;
+      const tileNum=bus.mem[tmBase+mapY*32+mapX];
       let tileAddr;
       if(signed) tileAddr=0x9000+((tileNum<<24)>>24)*16;
       else tileAddr=0x8000+tileNum*16;
-      const px=(x+scx)&7, py=(y+scy)&7;
+      const px=offX&7, py=tileY&7;
       const lo=bus.mem[tileAddr+py*2], hi=bus.mem[tileAddr+py*2+1];
       const bit=7-px;
       const color=((lo>>bit)&1)|(((hi>>bit)&1)<<1);
       this.framebuffer[y*160+x]=(bgp>>(color*2))&3;
     }
+    if(winEnabled) this.windowLine++;
   }
   renderSprites(bus){
     const lcdc=bus.mem[0xFF40];

@@ -1,6 +1,6 @@
 // PPU —— GameBoy 的第二颗芯片：按扫描线画图
 // 屏幕 160×144 像素，每帧 456 周期/线 × 154 线（144 可见 + 10 行 VBlank）。
-// 本批只做背景图（BG），精灵（OBJ）和窗口（Window）下批再说。
+// 已实现：背景层 BG（滚动）、窗口层 Window（钉死的 UI 贴纸）、精灵层 OBJ。
 // 输出 framebuffer：160×144，每像素 0~3 的色号，外壳负责上色。
 
 pub const SCREEN_W: usize = 160;
@@ -10,11 +10,12 @@ pub struct Ppu {
     pub framebuffer: [[u8; SCREEN_W]; SCREEN_H],
     pub line_cycles: u32,   // 本扫描线已走周期
     pub ly: u8,             // 当前行号（0~153）
+    pub window_line: u8,    // 窗口层内部行计数器（从 WY 那行起逐行 +1）
 }
 
 impl Ppu {
     pub fn new() -> Self {
-        Ppu { framebuffer: [[0; SCREEN_W]; SCREEN_H], line_cycles: 0, ly: 0 }
+        Ppu { framebuffer: [[0; SCREEN_W]; SCREEN_H], line_cycles: 0, ly: 0, window_line: 0 }
     }
 
     // 每走 t 个周期调一次，推进扫描线状态机
@@ -30,6 +31,7 @@ impl Ppu {
                 bus.mem[0xFF0F] |= 0x01;        // 请求 VBlank 中断
             } else if self.ly > 153 {
                 self.ly = 0;                     // 回绕到帧首
+                self.window_line = 0;            // 窗口内部计数器每帧清零
             }
             bus.mem[0xFF44] = self.ly;           // LY 寄存器同步
             // 可见行才画（VBlank 的 10 行不画）
@@ -79,7 +81,7 @@ impl Ppu {
         }
     }
 
-    // 画一行背景：从 VRAM 取地图+图块，上色进 framebuffer
+    // 画一行：先画背景层 BG，再在 WX 以右叠上窗口层 Window，最后精灵层 OBJ（在 tick 里调）
     fn render_line(&mut self, bus: &mut crate::Bus) {
         let lcdc = bus.mem[0xFF40];
         if lcdc & 0x80 == 0 {                    // LCD 关着 → 整行空白
@@ -95,10 +97,23 @@ impl Ppu {
         let signed_tiles = lcdc & 0x10 == 0;
         let bgp = bus.mem[0xFF47];               // 调色板：每2位一个色号映射
 
+        // 窗口层是否在本行生效：开关开 + 窗口顶边 WY <= 当前行
+        // 注意 WX 存的是真实左边沿 +7，取址时用 (x + 7 - wx) 就正好是贴纸内的偏移
+        let win_enabled = lcdc & 0x20 != 0 && (bus.mem[0xFF4A] as usize) <= y;
+        let wx = bus.mem[0xFF4B] as usize;
+        // 窗口图块地图基址：LCDC bit6（0=9800，1=9C00），与 BG 独立
+        let win_map_base = if lcdc & 0x40 != 0 { 0x9C00 } else { 0x9800 };
+
         for x in 0..SCREEN_W {
-            let map_x = ((x + scx) & 255) / 8;   // 32×32 图块地图里的哪块
-            let map_y = ((y + scy) & 255) / 8;
-            let tile_idx_addr = map_base + map_y * 32 + map_x;
+            // 判断这一列属于窗口层还是背景层
+            let (tile_map_base, tile_y, tile_off_x) = if win_enabled && x + 7 >= wx {
+                (win_map_base, self.window_line as usize, x + 7 - wx)
+            } else {
+                (map_base, (y + scy) & 255, (x + scx) & 255)
+            };
+            let map_x = tile_off_x / 8;
+            let map_y = tile_y / 8;
+            let tile_idx_addr = tile_map_base + map_y * 32 + map_x;
             let tile_num = bus.mem[tile_idx_addr] as usize;
             // 算图块在 VRAM 里的地址（有符号模式的偏移）
             let tile_addr = if signed_tiles {
@@ -107,14 +122,18 @@ impl Ppu {
                 0x8000 + tile_num * 16
             };
             // 图块内偏移：每块 8×8，每像素 2 bit（两个位平面）
-            let px_in_tile = (x + scx) & 7;
-            let py_in_tile = (y + scy) & 7;
+            let px_in_tile = tile_off_x & 7;
+            let py_in_tile = tile_y & 7;
             let lo = bus.mem[tile_addr + py_in_tile * 2];
             let hi = bus.mem[tile_addr + py_in_tile * 2 + 1];
             let bit = 7 - px_in_tile;            // 最左像素在最高位
             let color = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
             // 过调色板：真机是灰度屏，颜色其实是映射出来的
             self.framebuffer[y][x] = (bgp >> (color * 2)) & 3;
+        }
+        // 本行画过窗口之后，窗口内部行号 +1（供下一行取贴纸下一行图块）
+        if win_enabled {
+            self.window_line += 1;
         }
     }
 
