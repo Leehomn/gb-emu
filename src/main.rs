@@ -1,0 +1,1057 @@
+// GameBoy 模拟器 —— 里程碑③④：Blargg 考卷 + PPU 显像
+// Sharp LR35902 CPU（全指令集+中断+定时器） + PPU（背景图渲染）。
+// 心智模型不变：取指 → 译码 → 执行，外加按周期推进的硬件外设。
+//
+// 已完成：
+//   · CPU 全指令（含 CB 前缀），Blargg 考卷 75/75 ok
+//   · 栈/调用/条件跳转、中断、DIV/TIMA 定时器
+//   · PPU：按扫描线渲染背景，VBlank 中断
+// 运行：cargo run --release -- roms/cpu_instrs.gb [--screenshot out.ppm]
+
+mod ppu;
+use ppu::Ppu;
+
+// ---------- 标志位（F 寄存器高 4 位） ----------
+const FLAG_Z: u8 = 0x80;   // 结果为 0
+const FLAG_N: u8 = 0x40;   // 刚才是减法
+const FLAG_H: u8 = 0x20;   // 低半字节进位
+const FLAG_C: u8 = 0x10;   // 进位/借位（你的 VF，但 SUB 时方向相反）
+
+// ---------- 寄存器组 ----------
+pub struct Registers {
+    pub a: u8, pub f: u8,
+    pub b: u8, pub c: u8,
+    pub d: u8, pub e: u8,
+    pub h: u8, pub l: u8,
+}
+
+impl Registers {
+    pub fn new() -> Self {
+        // 真机 Boot ROM 留下的开机初值
+        Registers { a: 0x01, f: 0xB0, b: 0x00, c: 0x13, d: 0x00, e: 0xD8, h: 0x01, l: 0x4D }
+    }
+    pub fn bc(&self) -> u16 { ((self.b as u16) << 8) | self.c as u16 }
+    pub fn de(&self) -> u16 { ((self.d as u16) << 8) | self.e as u16 }
+    pub fn hl(&self) -> u16 { ((self.h as u16) << 8) | self.l as u16 }
+    pub fn af(&self) -> u16 { ((self.a as u16) << 8) | self.f as u16 }
+    pub fn set_bc(&mut self, v: u16) { self.b = (v >> 8) as u8; self.c = v as u8; }
+    pub fn set_de(&mut self, v: u16) { self.d = (v >> 8) as u8; self.e = v as u8; }
+    pub fn set_hl(&mut self, v: u16) { self.h = (v >> 8) as u8; self.l = v as u8; }
+    pub fn set_af(&mut self, v: u16) { self.a = (v >> 8) as u8; self.f = (v as u8) & 0xF0; } // 低4位恒0
+    pub fn flag(&self, mask: u8) -> bool { self.f & mask != 0 }
+    pub fn set_flag(&mut self, mask: u8, on: bool) {
+        if on { self.f |= mask; } else { self.f &= !mask; }
+    }
+    // 按编号读寄存器（6 = 通过 HL 指针访存，需要总线，单独处理）
+    pub fn get(&self, i: u8) -> u8 {
+        match i { 0=>self.b, 1=>self.c, 2=>self.d, 3=>self.e, 4=>self.h, 5=>self.l, 7=>self.a, _=> unreachable!() }
+    }
+    pub fn set(&mut self, i: u8, v: u8) {
+        match i { 0=>self.b=v, 1=>self.c=v, 2=>self.d=v, 3=>self.e=v, 4=>self.h=v, 5=>self.l=v, 7=>self.a=v, _=> unreachable!() }
+    }
+}
+
+// ---------- 64KB 总线 ----------
+// 真机上不同地址段通向不同硬件。本批接两样：
+//   · 卡带 ROM（0x0000~0x7FFF）：只读，写进去会被忽略（真机靠 MBC 芯片换页，先不管）
+//   · 串口（0xFF01 数据 / 0xFF02 控制）：Blargg 考卷用它打印成绩单！
+//     往 FF02 写 0x81 = 「把 FF01 里的字符发出去」，我们把它收进字符串。
+pub struct Bus {
+    pub mem: Vec<u8>,
+    pub serial_out: String,   // 考卷成绩单收集处
+    pub div_acc: u32,         // DIV 分频累加器（每周期+1，满256归零并让DIV+1）
+    pub tac: u8,              // 定时器控制（低3位有效）
+    pub tima_acc: u32,        // TIMA 分频累加器
+    pub joypad_dir: u8,       // 方向键状态（bit0~3 = 右左上下，0=按下）
+    pub joypad_btn: u8,       // 功能键状态（bit0~3 = A B Select Start，0=按下）
+    pub joy_reads: u64,       // 诊断：游戏读了多少次手柄
+    pub joy_log: Vec<(u64, u8, u8)>,  // 诊断：(第几次读, 选择位, 返回值) 最近几次
+}
+impl Bus {
+    pub fn new() -> Self {
+        let mut b = Bus { mem: vec![0; 0x10000], serial_out: String::new(), div_acc: 0, tac: 0, tima_acc: 0, joypad_dir: 0x0F, joypad_btn: 0x0F, joy_reads: 0, joy_log: Vec::new() };
+        b.mem[0xFF44] = 0x00;   // LY：现在由 PPU 真正驱动，不再谎报
+        b
+    }
+    pub fn read(&mut self, addr: u16) -> u8 {
+        if addr == 0xFF00 {
+            // Joypad 读：bit4/5 是选择线（0=选中），返回低4位按键状态（0=按下）
+            let sel = self.mem[0xFF00];
+            let mut result = 0x0F;   // 默认全没按
+            if sel & 0x20 == 0 {
+                // 选中方向键（P15）：右左上下 → bit0~3
+                result &= self.joypad_dir;
+            }
+            if sel & 0x10 == 0 {
+                // 选中功能键（P14）：Select Start B A → bit3~0（注意顺序）
+                result &= self.joypad_btn;
+            }
+            let r = (sel & 0x30) | result | 0xC0;   // 高2位恒1
+            self.joy_reads += 1;
+            if self.joy_log.len() < 40 { self.joy_log.push((self.joy_reads, sel, r)); }
+            return r;
+        }
+        self.mem[addr as usize]
+    }
+    pub fn write(&mut self, addr: u16, val: u8) {
+        if addr < 0x8000 { return; }   // 卡带区只读
+        match addr {
+            0xFF04 => { self.mem[0xFF04] = 0; self.div_acc = 0; return; }  // 写DIV=清零
+            0xFF05 => { self.mem[0xFF05] = val; return; }                  // TIMA 直接写
+            0xFF06 => { self.mem[0xFF06] = val; return; }                  // TMA
+            0xFF07 => { self.tac = val & 7; self.mem[0xFF07] = val; return; }
+            0xFF0F => { self.mem[0xFF0F] = val & 0x1F; return; }           // IF 低5位
+            0xFF44 => { return; }                                          // LY 只读
+            0xFF41 => { self.mem[0xFF41] = (self.mem[0xFF41] & 0x07) | (val & 0xF8); return; }  // STAT：bit0-2只读，游戏只能写bit3-6使能位
+            0xFF46 => {                                                    // DMA：把 XX00~XX9F 搬到 OAM
+                let src = (val as u16) << 8;
+                for i in 0..0xA0u16 {
+                    let v = self.mem[(src + i) as usize];
+                    self.mem[0xFE00 + i as usize] = v;
+                }
+                return;
+            }
+            _ => {}
+        }
+        self.mem[addr as usize] = val;
+        if addr == 0xFF02 && val == 0x81 {
+            // 串口发送：取出 FF01 的字符，记进成绩单，控制位归零
+            let ch = self.mem[0xFF01] as char;
+            self.serial_out.push(ch);
+            self.mem[0xFF02] = 0;
+        }
+    }
+    // 每走 t 个周期调一次：DIV/TIMA 按真实时间走（你 CHIP-8 批次④的教训！）
+    pub fn tick(&mut self, t: u32) {
+        // DIV：每 256 周期 +1
+        self.div_acc += t;
+        while self.div_acc >= 256 {
+            self.div_acc -= 256;
+            self.mem[0xFF04] = self.mem[0xFF04].wrapping_add(1);
+        }
+        // TIMA：TAC 使能时按选定频率 +1，溢出回装 TMA 并置 IF 第2位
+        if self.tac & 4 != 0 {
+            let period: u32 = match self.tac & 3 { 0 => 1024, 1 => 16, 2 => 64, _ => 256 };
+            self.tima_acc += t;
+            while self.tima_acc >= period {
+                self.tima_acc -= period;
+                let (v, ov) = self.mem[0xFF05].overflowing_add(1);
+                if ov {
+                    self.mem[0xFF05] = self.mem[0xFF06];       // 溢出回装 TMA
+                    self.mem[0xFF0F] |= 0x04;                  // 请求定时器中断
+                } else {
+                    self.mem[0xFF05] = v;
+                }
+            }
+        }
+    }
+    pub fn read16(&mut self, addr: u16) -> u16 {
+        (self.read(addr) as u16) | ((self.read(addr.wrapping_add(1)) as u16) << 8)  // 小端
+    }
+    pub fn write16(&mut self, addr: u16, val: u16) {
+        self.write(addr, val as u8);
+        self.write(addr.wrapping_add(1), (val >> 8) as u8);
+    }
+    // 装卡带：ROM 拷进低 32KB
+    pub fn load_rom(&mut self, rom: &[u8]) {
+        let n = rom.len().min(0x8000);
+        self.mem[..n].copy_from_slice(&rom[..n]);
+    }
+}
+
+// ---------- CPU ----------
+pub struct Cpu {
+    pub reg: Registers,
+    pub pc: u16,
+    pub sp: u16,          // 栈指针：新抽屉！指向「下一个空位」
+    pub halted: bool,
+    pub ime: bool,        // 中断总开关（EI/DI 改它，中断本身下批做）
+    pub cycles: u64,
+    pub unknown: Vec<(u8, u16)>,   // 未实现指令记录（去重），考完对答案用
+}
+
+impl Cpu {
+    pub fn new() -> Self {
+        Cpu { reg: Registers::new(), pc: 0x0100, sp: 0xFFFE, halted: false, ime: false, cycles: 0, unknown: Vec::new() }
+    }
+
+    fn fetch8(&mut self, bus: &mut Bus) -> u8 {
+        let v = bus.read(self.pc);
+        self.pc = self.pc.wrapping_add(1);
+        v
+    }
+    fn fetch16(&mut self, bus: &mut Bus) -> u16 {
+        let lo = self.fetch8(bus) as u16;
+        let hi = self.fetch8(bus) as u16;
+        (hi << 8) | lo
+    }
+    // 栈操作：先减 SP 再写（栈向低地址长）；弹栈先读再加
+    fn push(&mut self, bus: &mut Bus, v: u16) {
+        self.sp = self.sp.wrapping_sub(2);
+        bus.write16(self.sp, v);
+    }
+    fn pop(&mut self, bus: &mut Bus) -> u16 {
+        let v = bus.read16(self.sp);
+        self.sp = self.sp.wrapping_add(2);
+        v
+    }
+
+    // 按编号读「寄存器或(HL)」—— 矩阵译码的取数口
+    fn get_r(&self, bus: &mut Bus, i: u8) -> u8 {
+        if i == 6 { bus.read(self.reg.hl()) } else { self.reg.get(i) }
+    }
+    fn set_r(&mut self, bus: &mut Bus, i: u8, v: u8) {
+        if i == 6 { bus.write(self.reg.hl(), v); } else { self.reg.set(i, v); }
+    }
+
+    // ---------- ALU 八族（统一入口，op 的高 3 位选族） ----------
+    // 族号：0=ADD 1=ADC 2=SUB 3=SBC 4=AND 5=XOR 6=OR 7=CP
+    fn alu(&mut self, kind: u8, v: u8) {
+        let a = self.reg.a;
+        let cin = if self.reg.flag(FLAG_C) { 1u16 } else { 0 };
+        match kind {
+            0 | 1 => {  // ADD / ADC（带进位加）
+                let sum = a as u16 + v as u16 + if kind == 1 { cin } else { 0 };
+                self.reg.set_flag(FLAG_H, (a & 0xF) + (v & 0xF) + (if kind==1 {cin as u8} else {0}) > 0xF);
+                self.reg.a = sum as u8;
+                self.reg.set_flag(FLAG_Z, self.reg.a == 0);
+                self.reg.set_flag(FLAG_N, false);
+                self.reg.set_flag(FLAG_C, sum > 0xFF);
+            }
+            2 | 3 => {  // SUB / SBC（带借位减）
+                let sub = v as u16 + if kind == 3 { cin } else { 0 };
+                let diff = a as i16 - sub as i16;
+                self.reg.set_flag(FLAG_H, (a & 0xF) < (v & 0xF) + (if kind==3 {cin as u8} else {0}));
+                self.reg.a = diff as u8;
+                self.reg.set_flag(FLAG_Z, self.reg.a == 0);
+                self.reg.set_flag(FLAG_N, true);
+                self.reg.set_flag(FLAG_C, diff < 0);
+            }
+            4 => {  // AND：H=1 是它的怪癖，记住
+                self.reg.a = a & v;
+                self.reg.set_flag(FLAG_Z, self.reg.a == 0);
+                self.reg.set_flag(FLAG_N, false);
+                self.reg.set_flag(FLAG_H, true);
+                self.reg.set_flag(FLAG_C, false);
+            }
+            5 => {  // XOR
+                self.reg.a = a ^ v;
+                self.reg.set_flag(FLAG_Z, self.reg.a == 0);
+                self.reg.set_flag(FLAG_N, false);
+                self.reg.set_flag(FLAG_H, false);
+                self.reg.set_flag(FLAG_C, false);
+            }
+            6 => {  // OR
+                self.reg.a = a | v;
+                self.reg.set_flag(FLAG_Z, self.reg.a == 0);
+                self.reg.set_flag(FLAG_N, false);
+                self.reg.set_flag(FLAG_H, false);
+                self.reg.set_flag(FLAG_C, false);
+            }
+            7 => {  // CP：就是 SUB，但不存结果！只留标志给条件跳转用
+                let diff = a as i16 - v as i16;
+                self.reg.set_flag(FLAG_H, (a & 0xF) < (v & 0xF));
+                self.reg.set_flag(FLAG_Z, diff as u8 == 0);
+                self.reg.set_flag(FLAG_N, true);
+                self.reg.set_flag(FLAG_C, diff < 0);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn inc8(&mut self, v: u8) -> u8 {
+        let r = v.wrapping_add(1);
+        self.reg.set_flag(FLAG_Z, r == 0);
+        self.reg.set_flag(FLAG_N, false);
+        self.reg.set_flag(FLAG_H, (v & 0xF) + 1 > 0xF);
+        r   // C 不动（考点）
+    }
+    fn dec8(&mut self, v: u8) -> u8 {
+        let r = v.wrapping_sub(1);
+        self.reg.set_flag(FLAG_Z, r == 0);
+        self.reg.set_flag(FLAG_N, true);
+        self.reg.set_flag(FLAG_H, (v & 0xF) == 0);
+        r
+    }
+
+    // 条件判断：cc 编号 0=NZ 1=Z 2=NC 3=C
+    fn cond(&self, cc: u8) -> bool {
+        match cc {
+            0 => !self.reg.flag(FLAG_Z),
+            1 => self.reg.flag(FLAG_Z),
+            2 => !self.reg.flag(FLAG_C),
+            3 => self.reg.flag(FLAG_C),
+            _ => unreachable!(),
+        }
+    }
+
+    // ---------- CB 前缀：第二指令表（位操作/旋转） ----------
+    fn step_cb(&mut self, bus: &mut Bus) -> u32 {
+        let op = self.fetch8(bus);
+        let i = op & 7;                 // 操作对象编号
+        let v = self.get_r(bus, i);
+        let kind = op >> 3;             // 0~7 旋转/移位族，8~15 BIT/RES/SET
+        let cycles = if i == 6 { 16 } else { 8 };
+        if kind < 8 {
+            let cin = if self.reg.flag(FLAG_C) { 1u8 } else { 0 };
+            let (r, cout) = match kind {
+                0 => (v.rotate_left(1), v >> 7),              // RLC：左转，最高位进 C 也回最低位
+                1 => (v.rotate_right(1), v & 1),              // RRC
+                2 => ((v << 1) | cin, v >> 7),                // RL：穿过 C 左转（9位环）
+                3 => ((v >> 1) | (cin << 7), v & 1),          // RR
+                4 => (v << 1, v >> 7),                        // SLA：算术左移
+                5 => ((v >> 1) | (v & 0x80), v & 1),          // SRA：算术右移，符号位保留
+                6 => (v.rotate_left(4), 0),                   // SWAP：高低半字节对调（GameBoy 特产）
+                7 => (v >> 1, v & 1),                         // SRL：逻辑右移
+                _ => unreachable!(),
+            };
+            self.set_r(bus, i, r);
+            self.reg.set_flag(FLAG_Z, r == 0);
+            self.reg.set_flag(FLAG_N, false);
+            self.reg.set_flag(FLAG_H, false);
+            self.reg.set_flag(FLAG_C, cout != 0);
+        } else {
+            let bit = (kind - 8) & 7;     // 第几位
+            match kind >> 3 {
+                1 => {  // BIT：只测不改。Z=「这位是0吗」，C 不动
+                    self.reg.set_flag(FLAG_Z, v & (1 << bit) == 0);
+                    self.reg.set_flag(FLAG_N, false);
+                    self.reg.set_flag(FLAG_H, true);
+                    return if i == 6 { 12 } else { 8 };
+                }
+                2 => self.set_r(bus, i, v & !(1 << bit)),   // RES：清零这位
+                3 => self.set_r(bus, i, v | (1 << bit)),    // SET：置一这位
+                _ => unreachable!(),
+            }
+        }
+        cycles
+    }
+
+    // ---------- 中断：每条指令后查一次 ----------
+    // IE(FFFF) 和 IF(FF0F) 按位与：哪位都亮 = 哪个中断在敲门。
+    // 受理：ime 关掉 → PC 压栈（你的 CALL！）→ 跳到固定向量地址。
+    // 向量表：VBlank=0040 LCD=0048 Timer=0050 Serial=0058 Joypad=0060
+    fn check_interrupts(&mut self, bus: &mut Bus) -> u32 {
+        let pending = bus.read(0xFFFF) & bus.read(0xFF0F) & 0x1F;
+        if pending == 0 { return 0; }
+        if self.halted { self.halted = false; }   // 有中断敲门就醒（哪怕 ime=0）
+        if !self.ime { return 0; }
+        for bit in 0..5u8 {
+            if pending & (1 << bit) != 0 {
+                self.ime = false;                              // 进门随手关门
+                let ifv = bus.read(0xFF0F);
+                bus.write(0xFF0F, ifv & !(1 << bit));          // 门铃消音
+                let ret = self.pc;
+                self.push(bus, ret);                           // 返程地址压栈
+                self.pc = 0x0040 + (bit as u16) * 8;           // 跳向量
+                return 20;
+            }
+        }
+        0
+    }
+
+    // ---------- 主译码 ----------
+    pub fn step(&mut self, bus: &mut Bus) -> u32 {
+        // HALT：不取指，但时间照走、中断照查（考卷02的HALT题就考这个）
+        if self.halted {
+            bus.tick(4);
+            self.cycles += 4;
+            let t = self.check_interrupts(bus);
+            self.cycles += t as u64;
+            return 4 + t;
+        }
+        let op = self.fetch8(bus);
+        let t = match op {
+            0x00 => 4,                                       // NOP
+            0x10 => { let _ = self.fetch8(bus); 4 }          // STOP：考卷用它在失败处刹车，先当2字节NOP
+            0x76 => { self.halted = true; 4 }                // HALT
+            0xF3 => { self.ime = false; 4 }                  // DI
+            0xFB => { self.ime = true; 4 }                   // EI
+
+            // --- LD rr, nn（16位装载，31 是 SP）---
+            0x01 => { let v = self.fetch16(bus); self.reg.set_bc(v); 12 }
+            0x11 => { let v = self.fetch16(bus); self.reg.set_de(v); 12 }
+            0x21 => { let v = self.fetch16(bus); self.reg.set_hl(v); 12 }
+            0x31 => { self.sp = self.fetch16(bus); 12 }
+
+            // --- 指针访存（BC/DE/HL±）---
+            0x02 => { let a = self.reg.a; bus.write(self.reg.bc(), a); 8 }
+            0x12 => { let a = self.reg.a; bus.write(self.reg.de(), a); 8 }
+            0x0A => { self.reg.a = bus.read(self.reg.bc()); 8 }
+            0x1A => { self.reg.a = bus.read(self.reg.de()); 8 }
+            0x22 => { let hl = self.reg.hl(); let a = self.reg.a; bus.write(hl, a); self.reg.set_hl(hl.wrapping_add(1)); 8 } // (HL+)
+            0x32 => { let hl = self.reg.hl(); let a = self.reg.a; bus.write(hl, a); self.reg.set_hl(hl.wrapping_sub(1)); 8 } // (HL-)
+            0x2A => { let hl = self.reg.hl(); self.reg.a = bus.read(hl); self.reg.set_hl(hl.wrapping_add(1)); 8 }
+            0x3A => { let hl = self.reg.hl(); self.reg.a = bus.read(hl); self.reg.set_hl(hl.wrapping_sub(1)); 8 }
+
+            // --- ADD HL, rr（16位加：只动 N/H/C，Z 不动——和8位版不同！）---
+            0x09|0x19|0x29|0x39 => {
+                let rr = match (op >> 4) & 3 { 0=>self.reg.bc(), 1=>self.reg.de(), 2=>self.reg.hl(), _=>self.sp };
+                let hl = self.reg.hl();
+                let sum = hl as u32 + rr as u32;
+                self.reg.set_flag(FLAG_N, false);
+                self.reg.set_flag(FLAG_H, (hl & 0xFFF) + (rr & 0xFFF) > 0xFFF);
+                self.reg.set_flag(FLAG_C, sum > 0xFFFF);
+                self.reg.set_hl(sum as u16); 8
+            }
+
+            // --- INC/DEC rr（16位自增减：一个标志都不动！）---
+            0x03 => { let v = self.reg.bc().wrapping_add(1); self.reg.set_bc(v); 8 }
+            0x13 => { let v = self.reg.de().wrapping_add(1); self.reg.set_de(v); 8 }
+            0x23 => { let v = self.reg.hl().wrapping_add(1); self.reg.set_hl(v); 8 }
+            0x33 => { self.sp = self.sp.wrapping_add(1); 8 }
+            0x0B => { let v = self.reg.bc().wrapping_sub(1); self.reg.set_bc(v); 8 }
+            0x1B => { let v = self.reg.de().wrapping_sub(1); self.reg.set_de(v); 8 }
+            0x2B => { let v = self.reg.hl().wrapping_sub(1); self.reg.set_hl(v); 8 }
+            0x3B => { self.sp = self.sp.wrapping_sub(1); 8 }
+
+            // --- INC/DEC r（8位，C 不动）---
+            0x04|0x0C|0x14|0x1C|0x24|0x2C|0x34|0x3C => {
+                let i = (op >> 3) & 7;
+                let v = self.get_r(bus, i);
+                let r = self.inc8(v);
+                self.set_r(bus, i, r);
+                if i == 6 { 12 } else { 4 }
+            }
+            0x05|0x0D|0x15|0x1D|0x25|0x2D|0x35|0x3D => {
+                let i = (op >> 3) & 7;
+                let v = self.get_r(bus, i);
+                let r = self.dec8(v);
+                self.set_r(bus, i, r);
+                if i == 6 { 12 } else { 4 }
+            }
+
+            // --- LD r, n（8位立即数装载，你的 6xnn）---
+            0x06|0x0E|0x16|0x1E|0x26|0x2E|0x36|0x3E => {
+                let i = (op >> 3) & 7;
+                let v = self.fetch8(bus);
+                self.set_r(bus, i, v);
+                if i == 6 { 12 } else { 8 }
+            }
+
+            // --- 杂项标志/累加器操作 ---
+            0x07 => {  // RLCA：A 左转，但 Z 恒 0（和 CB 版不同！）
+                let a = self.reg.a; let c = a >> 7;
+                self.reg.a = a.rotate_left(1);
+                self.reg.set_flag(FLAG_Z, false);
+                self.reg.set_flag(FLAG_N, false);
+                self.reg.set_flag(FLAG_H, false);
+                self.reg.set_flag(FLAG_C, c != 0); 4
+            }
+            0x0F => {  // RRCA
+                let a = self.reg.a; let c = a & 1;
+                self.reg.a = a.rotate_right(1);
+                self.reg.set_flag(FLAG_Z, false);
+                self.reg.set_flag(FLAG_N, false);
+                self.reg.set_flag(FLAG_H, false);
+                self.reg.set_flag(FLAG_C, c != 0); 4
+            }
+            0x17 => {  // RLA：穿 C 左转，Z 恒 0
+                let a = self.reg.a; let cin = if self.reg.flag(FLAG_C) {1} else {0};
+                self.reg.a = (a << 1) | cin;
+                self.reg.set_flag(FLAG_Z, false);
+                self.reg.set_flag(FLAG_N, false);
+                self.reg.set_flag(FLAG_H, false);
+                self.reg.set_flag(FLAG_C, a >> 7 != 0); 4
+            }
+            0x1F => {  // RRA
+                let a = self.reg.a; let cin = if self.reg.flag(FLAG_C) {1} else {0};
+                self.reg.a = (a >> 1) | (cin << 7);
+                self.reg.set_flag(FLAG_Z, false);
+                self.reg.set_flag(FLAG_N, false);
+                self.reg.set_flag(FLAG_H, false);
+                self.reg.set_flag(FLAG_C, a & 1 != 0); 4
+            }
+            0x27 => {  // DAA：把「十六进制加法结果」修成 BCD（十进制）
+                let mut a = self.reg.a;
+                let mut corr = 0u8;
+                let mut cout = self.reg.flag(FLAG_C);
+                if !self.reg.flag(FLAG_N) {
+                    if self.reg.flag(FLAG_H) || (a & 0xF) > 9 { corr |= 0x06; }
+                    if cout || a > 0x99 { corr |= 0x60; cout = true; }
+                    a = a.wrapping_add(corr);
+                } else {
+                    if self.reg.flag(FLAG_H) { corr |= 0x06; }
+                    if cout { corr |= 0x60; }
+                    a = a.wrapping_sub(corr);
+                }
+                self.reg.a = a;
+                self.reg.set_flag(FLAG_Z, a == 0);
+                self.reg.set_flag(FLAG_H, false);
+                self.reg.set_flag(FLAG_C, cout); 4
+            }
+            0x2F => {  // CPL：A 按位取反
+                self.reg.a = !self.reg.a;
+                self.reg.set_flag(FLAG_N, true);
+                self.reg.set_flag(FLAG_H, true); 4
+            }
+            0x37 => {  // SCF：C 置 1
+                self.reg.set_flag(FLAG_N, false);
+                self.reg.set_flag(FLAG_H, false);
+                self.reg.set_flag(FLAG_C, true); 4
+            }
+            0x3F => {  // CCF：C 翻转
+                let c = self.reg.flag(FLAG_C);
+                self.reg.set_flag(FLAG_N, false);
+                self.reg.set_flag(FLAG_H, false);
+                self.reg.set_flag(FLAG_C, !c); 4
+            }
+
+            // --- LD r, r' 全矩阵（0x40~0x7F，挖掉 0x76=HALT）---
+            0x40..=0x7F => {
+                let dst = (op >> 3) & 7;
+                let src = op & 7;
+                let v = self.get_r(bus, src);
+                self.set_r(bus, dst, v);
+                if dst == 6 || src == 6 { 8 } else { 4 }
+            }
+
+            // --- ALU A, r 八族矩阵（0x80~0xBF）---
+            0x80..=0xBF => {
+                let kind = (op >> 3) & 7;
+                let v = self.get_r(bus, op & 7);
+                self.alu(kind, v);
+                if (op & 7) == 6 { 8 } else { 4 }
+            }
+
+            // --- POP / PUSH（栈：你的返程本，现在是通用数据栈）---
+            0xC1 => { let v = self.pop(bus); self.reg.set_bc(v); 12 }
+            0xD1 => { let v = self.pop(bus); self.reg.set_de(v); 12 }
+            0xE1 => { let v = self.pop(bus); self.reg.set_hl(v); 12 }
+            0xF1 => { let v = self.pop(bus); self.reg.set_af(v); 12 }  // F 低4位被屏蔽
+            0xC5 => { let v = self.reg.bc(); self.push(bus, v); 16 }
+            0xD5 => { let v = self.reg.de(); self.push(bus, v); 16 }
+            0xE5 => { let v = self.reg.hl(); self.push(bus, v); 16 }
+            0xF5 => { let v = self.reg.af(); self.push(bus, v); 16 }
+
+            // --- 条件跳转/调用/返回（cc = (op>>3)&3）---
+            0xC2|0xCA|0xD2|0xDA => {  // JP cc, nn
+                let a = self.fetch16(bus);
+                if self.cond((op >> 3) & 3) { self.pc = a; 16 } else { 12 }
+            }
+            0xC3 => { self.pc = self.fetch16(bus); 16 }       // JP nn
+            0xE9 => { self.pc = self.reg.hl(); 4 }            // JP (HL)：跳到指针处
+            0xC4|0xCC|0xD4|0xDC => {  // CALL cc, nn
+                let a = self.fetch16(bus);
+                if self.cond((op >> 3) & 3) {
+                    let ret = self.pc;
+                    self.push(bus, ret);
+                    self.pc = a; 24
+                } else { 12 }
+            }
+            0xCD => {  // CALL nn：你的 2nnn！存返程地址再跳
+                let a = self.fetch16(bus);
+                let ret = self.pc;
+                self.push(bus, ret);
+                self.pc = a; 24
+            }
+            0xC0|0xC8|0xD0|0xD8 => {  // RET cc
+                if self.cond((op >> 3) & 3) {
+                    self.pc = self.pop(bus); 20
+                } else { 8 }
+            }
+            0xC9 => { self.pc = self.pop(bus); 16 }           // RET：你的 00EE！
+            0xD9 => { self.pc = self.pop(bus); self.ime = true; 16 }  // RETI
+            0xC7|0xCF|0xD7|0xDF|0xE7|0xEF|0xF7|0xFF => {  // RST：一步跳到固定地址
+                let ret = self.pc;
+                self.push(bus, ret);
+                self.pc = (op & 0x38) as u16; 16
+            }
+
+            // --- ALU A, n（立即数版八族）---
+            0xC6|0xCE|0xD6|0xDE|0xE6|0xEE|0xF6|0xFE => {
+                let kind = (op >> 3) & 7;
+                let v = self.fetch8(bus);
+                self.alu(kind, v); 8
+            }
+
+            // --- 相对跳转 JR（含条件版）---
+            0x18 => { let off = self.fetch8(bus) as i8;
+                self.pc = (self.pc as i32 + off as i32) as u16; 12 }
+            0x20|0x28|0x30|0x38 => {
+                let off = self.fetch8(bus) as i8;
+                if self.cond((op >> 3) & 3) {
+                    self.pc = (self.pc as i32 + off as i32) as u16; 12
+                } else { 8 }
+            }
+
+            // --- 零页/绝对地址访存 ---
+            0xE0 => { let n = self.fetch8(bus) as u16; let a = self.reg.a; bus.write(0xFF00 + n, a); 12 } // LDH (n),A
+            0xF0 => { let n = self.fetch8(bus) as u16; self.reg.a = bus.read(0xFF00 + n); 12 }           // LDH A,(n)
+            0xE2 => { let c = self.reg.c as u16; let a = self.reg.a; bus.write(0xFF00 + c, a); 8 }       // LD (C),A
+            0xF2 => { let c = self.reg.c as u16; self.reg.a = bus.read(0xFF00 + c); 8 }                  // LD A,(C)
+            0xEA => { let a16 = self.fetch16(bus); let a = self.reg.a; bus.write(a16, a); 16 }           // LD (nn),A
+            0xFA => { let a16 = self.fetch16(bus); self.reg.a = bus.read(a16); 16 }                     // LD A,(nn)
+            0x08 => { let a16 = self.fetch16(bus); let sp = self.sp; bus.write16(a16, sp); 20 }         // LD (nn),SP
+            0xF9 => { self.sp = self.reg.hl(); 8 }                                                     // LD SP,HL
+
+            // --- SP 相对运算（标志按低字节算，Z/N 恒 0——怪但照做）---
+            0xE8 => {  // ADD SP, n（有符号立即数）
+                let n = self.fetch8(bus) as i8 as i16 as u16;
+                let sp = self.sp;
+                let lo = sp as u8;
+                self.reg.set_flag(FLAG_Z, false);
+                self.reg.set_flag(FLAG_N, false);
+                self.reg.set_flag(FLAG_H, (lo & 0xF) + (n as u8 & 0xF) > 0xF);
+                self.reg.set_flag(FLAG_C, lo as u16 + (n & 0xFF) > 0xFF);
+                self.sp = sp.wrapping_add(n); 16
+            }
+            0xF8 => {  // LD HL, SP+n
+                let n = self.fetch8(bus) as i8 as i16 as u16;
+                let sp = self.sp;
+                let lo = sp as u8;
+                self.reg.set_flag(FLAG_Z, false);
+                self.reg.set_flag(FLAG_N, false);
+                self.reg.set_flag(FLAG_H, (lo & 0xF) + (n as u8 & 0xF) > 0xF);
+                self.reg.set_flag(FLAG_C, lo as u16 + (n & 0xFF) > 0xFF);
+                self.reg.set_hl(sp.wrapping_add(n)); 12
+            }
+
+            0xCB => self.step_cb(bus),   // 第二指令表
+
+            _ => {
+                let at = self.pc.wrapping_sub(1);
+                if !self.unknown.iter().any(|&(o, a)| o == op && a == at) {
+                    self.unknown.push((op, at));
+                }
+                4
+            }
+        };
+        self.cycles += t as u64;
+        bus.tick(t);                          // 硬件时钟跟着指令走
+        let it = self.check_interrupts(bus);  // 指令间隙查中断
+        self.cycles += it as u64;
+        t + it
+    }
+}
+
+fn main() {
+    // 带参数 = 跑考卷：cargo run --release -- roms/cpu_instrs.gb [--screenshot out.ppm]
+    // --play = 实时窗口玩：cargo run --release -- roms/<游戏>.gb --play
+    // 不带参数 = CALL/RET 小演示
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--play") {
+        let rom_path = args.iter().find(|a| a.ends_with(".gb")).expect("要指定 ROM 文件");
+        play(rom_path);
+        return;
+    }
+    if args.len() > 1 {
+        let rom = std::fs::read(&args[1]).expect("读不到 ROM 文件");
+        let mut bus = Bus::new();
+        bus.load_rom(&rom);
+        let mut cpu = Cpu::new();
+        let mut ppu = Ppu::new();
+        let screenshot = args.iter().position(|a| a == "--screenshot").map(|i| args[i + 1].clone());
+        let frames_limit: u64 = if screenshot.is_some() { u64::MAX } else { u64::MAX };
+        println!("考卷开跑：{}（{} 字节）", args[1], rom.len());
+        let mut last_len = 0usize;
+        let mut stuck = 0u32;
+        let mut frames = 0u64;
+        let mut prev_ly = 0u8;
+        let press_start = args.iter().any(|a| a == "--press-start");   // 诊断：自动按Start
+        for _i in 0..500_000_000u64 {
+            // 诊断脚本：第30~40帧按住 Start（Enter 对应的键位）
+            if press_start {
+                if frames >= 30 && frames < 40 { bus.joypad_btn &= !0x08; } else { bus.joypad_btn |= 0x08; }
+            }
+            let t = cpu.step(&mut bus);
+            ppu.tick(t, &mut bus);
+            if ppu.ly == 0 && prev_ly != 0 { frames += 1; }   // 行号回绕 = 一帧过完
+            prev_ly = ppu.ly;
+            if _i % 5_000_000 == 0 && _i > 0 {
+                if bus.serial_out.len() == last_len { stuck += 1; } else { stuck = 0; }
+                last_len = bus.serial_out.len();
+                if stuck >= 2 && screenshot.is_none() { println!("成绩单已稳定，判定交卷"); break; }
+            }
+            if frames >= frames_limit { break; }
+            if press_start && frames >= 80 { break; }   // 诊断：按完Start再跑40帧就停
+            if bus.serial_out.contains("Passed") || bus.serial_out.contains("Failed") {
+                if screenshot.is_none() { break; }
+            }
+            if cpu.unknown.len() > 20 { println!("未实现指令太多，提前交卷"); break; }
+        }
+        if let Some(path) = screenshot {
+            // 截图模式：跑到「成绩单稳定」（全文打完）才拍，不然屏幕只有一行
+            if stuck < 2 {
+                println!("再跑一会儿让屏幕字打完……");
+                let mut s = 0;
+                let mut last = bus.serial_out.len();
+                for i in 0..600_000_000u64 {
+                    let t = cpu.step(&mut bus);
+                    ppu.tick(t, &mut bus);
+                    if i % 5_000_000 == 0 && i > 0 {
+                        if bus.serial_out.len() == last { s += 1; } else { s = 0; }
+                        last = bus.serial_out.len();
+                        if s >= 3 { println!("全文打完"); break; }
+                    }
+                }
+            }
+            save_ppm(&path, &ppu.framebuffer);
+            println!("截图已存：{}", path);
+        }
+        let lines: Vec<&str> = bus.serial_out.lines().collect();
+        let start = if lines.len() > 20 { lines.len() - 20 } else { 0 };
+        for line in &lines[start..] { println!("{}", line); }
+        if lines.len() > 20 { println!("……（前面省略 {} 行）", lines.len() - 20); }
+        println!("===== 结束 =====");
+        println!("共 {} 条指令，{} 周期", cpu.cycles, cpu.cycles);
+        if press_start {
+            println!("手柄被读了 {} 次", bus.joy_reads);
+            println!("前40次读取: 选择位/返回值");
+            for &(n, sel, r) in &bus.joy_log { println!("  #{n}: sel={sel:02X} → {r:02X}"); }
+        }
+        if !cpu.unknown.is_empty() {
+            println!("未实现指令清单（{} 处）：", cpu.unknown.len());
+            for &(op, at) in &cpu.unknown { println!("  {op:02X} @ {at:04X}"); }
+        }
+        return;
+    }
+    // 演示：CALL/RET 子程序 —— 你的 2nnn/00EE 在 GameBoy 上复活
+    let mut bus = Bus::new();
+    let mut cpu = Cpu::new();
+    // 0x0100: LD A,10 / LD B,5 / CALL 0x0150 / HALT
+    let main_prog: [u8; 8] = [0x3E, 10, 0x06, 5, 0xCD, 0x50, 0x01, 0x76];
+    bus.mem[0x0100..0x0108].copy_from_slice(&main_prog);
+    // 0x0150: ADD A,B / RET（子程序：把 B 加进 A 再回家）
+    bus.mem[0x0150] = 0x80;
+    bus.mem[0x0151] = 0xC9;
+    while !cpu.halted { cpu.step(&mut bus); }
+    println!("A={}（应为15） SP={:04X}（应回FFFE） 周期={}", cpu.reg.a, cpu.sp, cpu.cycles);
+}
+
+// ---------- 实时窗口（minifb） ----------
+// 真机节奏：一帧 = 70224 周期（456×154），每秒约 59.7 帧。
+// 主循环：跑一帧的指令 → 把 framebuffer 涂色上屏 → 采样键盘 → 睡到下一帧。
+fn play(rom_path: &str) {
+    use minifb::{Key, Window, WindowOptions};
+    use std::time::{Duration, Instant};
+
+    let rom = std::fs::read(rom_path).expect("读不到 ROM");
+    let mut bus = Bus::new();
+    bus.load_rom(&rom);
+    let mut cpu = Cpu::new();
+    let mut ppu = Ppu::new();
+
+    let scale = 4;
+    let (w, h) = (ppu::SCREEN_W * scale, ppu::SCREEN_H * scale);
+    println!("准备开窗: {}x{}", w, h);
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+    let mut window = Window::new(
+        &format!("GameBoy 模拟器 · {}", rom_path),
+        w, h,
+        WindowOptions { resize: false, ..WindowOptions::default() },
+    ).expect("开窗失败");
+    println!("窗口已创建，is_open={}", window.is_open());
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+
+    // 调色板：经典 GameBoy 绿屏四档
+    let palette: [u32; 4] = [0xE0F8D0, 0x88C070, 0x346856, 0x081820];
+    let mut pixels = vec![0u32; w * h];
+    let frame_time = Duration::from_micros(16_740);   // 59.7 fps
+
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        let t0 = Instant::now();
+
+        // 诊断：打印按键检测
+        let keys = window.get_keys();
+        if !keys.is_empty() {
+            println!("检测到按键: {:?}", keys);
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        }
+
+        // 采样键盘 → Joypad 寄存器（0=按下）
+        // 方向：方向键；功能：X=A Z=B Enter=Start 右Shift=Select
+        bus.joypad_dir = 0x0F;
+        bus.joypad_btn = 0x0F;
+        if window.is_key_down(Key::Right) { bus.joypad_dir &= !0x01; }
+        if window.is_key_down(Key::Left)  { bus.joypad_dir &= !0x02; }
+        if window.is_key_down(Key::Up)    { bus.joypad_dir &= !0x04; }
+        if window.is_key_down(Key::Down)  { bus.joypad_dir &= !0x08; }
+        if window.is_key_down(Key::X)     { bus.joypad_btn &= !0x01; }
+        if window.is_key_down(Key::Z)     { bus.joypad_btn &= !0x02; }
+        if window.is_key_down(Key::RightShift) { bus.joypad_btn &= !0x04; }
+        if window.is_key_down(Key::Enter) { bus.joypad_btn &= !0x08; }
+
+        // 跑一帧：70224 周期
+        let mut spent = 0u32;
+        while spent < 70224 {
+            let t = cpu.step(&mut bus);
+            ppu.tick(t, &mut bus);
+            spent += t;
+        }
+
+        // 涂色上屏
+        for y in 0..ppu::SCREEN_H {
+            for x in 0..ppu::SCREEN_W {
+                let c = palette[ppu.framebuffer[y][x] as usize];
+                for sy in 0..scale {
+                    for sx in 0..scale {
+                        pixels[(y * scale + sy) * w + x * scale + sx] = c;
+                    }
+                }
+            }
+        }
+        window.update_with_buffer(&pixels, w, h).expect("上屏失败");
+
+        // 睡到下一帧（限速）
+        let elapsed = t0.elapsed();
+        if elapsed < frame_time { std::thread::sleep(frame_time - elapsed); }
+    }
+}
+
+// 把 framebuffer 存成 PPM 图片（GameBoy 四档灰度，放大4倍方便看）
+fn save_ppm(path: &str, fb: &[[u8; ppu::SCREEN_W]; ppu::SCREEN_H]) {
+    let scale = 4;
+    let (w, h) = (ppu::SCREEN_W * scale, ppu::SCREEN_H * scale);
+    let mut out = format!("P3\n{} {}\n255\n", w, h);
+    let shades = [255, 170, 85, 0];   // 色号0=白 3=黑（真机灰度）
+    for y in 0..ppu::SCREEN_H {
+        for _sy in 0..scale {
+            for x in 0..ppu::SCREEN_W {
+                let c = shades[fb[y][x] as usize];
+                for _sx in 0..scale { out.push_str(&format!("{c} {c} {c}\n")); }
+            }
+        }
+    }
+    std::fs::write(path, out).expect("写截图失败");
+}
+
+// ---------- 单元测试 ----------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(program: &[u8], steps: usize) -> (Cpu, Bus) {
+        let mut bus = Bus::new();
+        let mut cpu = Cpu::new();
+        bus.mem[0x0100..0x0100 + program.len()].copy_from_slice(program);
+        for _ in 0..steps { cpu.step(&mut bus); }
+        (cpu, bus)
+    }
+
+    // ===== 批次1 回归（15组）=====
+    #[test] fn ld_a_n() {
+        let (cpu, _) = run(&[0x3E, 0x42], 1);
+        assert_eq!(cpu.reg.a, 0x42); assert_eq!(cpu.pc, 0x0102);
+    }
+    #[test] fn add_basic() {
+        let (cpu, _) = run(&[0x3E, 10, 0x06, 5, 0x80], 3);
+        assert_eq!(cpu.reg.a, 15);
+        assert!(!cpu.reg.flag(FLAG_Z)); assert!(!cpu.reg.flag(FLAG_C)); assert!(!cpu.reg.flag(FLAG_N));
+    }
+    #[test] fn add_carry_and_zero() {
+        let (cpu, _) = run(&[0x3E, 0xFF, 0x06, 1, 0x80], 3);
+        assert_eq!(cpu.reg.a, 0); assert!(cpu.reg.flag(FLAG_Z)); assert!(cpu.reg.flag(FLAG_C));
+    }
+    #[test] fn add_half_carry() {
+        let (cpu, _) = run(&[0x3E, 0x0F, 0x06, 0x01, 0x80], 3);
+        assert_eq!(cpu.reg.a, 0x10); assert!(cpu.reg.flag(FLAG_H)); assert!(!cpu.reg.flag(FLAG_C));
+    }
+    #[test] fn sub_borrow() {
+        let (cpu, _) = run(&[0x3E, 5, 0x06, 10, 0x90], 3);
+        assert_eq!(cpu.reg.a, 251); assert!(cpu.reg.flag(FLAG_C)); assert!(cpu.reg.flag(FLAG_N));
+    }
+    #[test] fn sub_zero() {
+        let (cpu, _) = run(&[0x3E, 7, 0x06, 7, 0x90], 3);
+        assert_eq!(cpu.reg.a, 0); assert!(cpu.reg.flag(FLAG_Z)); assert!(!cpu.reg.flag(FLAG_C));
+    }
+    #[test] fn inc_does_not_touch_carry() {
+        let (cpu, _) = run(&[0x3E, 0xFF, 0x06, 1, 0x80, 0x3C], 4);
+        assert_eq!(cpu.reg.a, 1); assert!(cpu.reg.flag(FLAG_C));
+    }
+    #[test] fn dec_to_zero() {
+        let (cpu, _) = run(&[0x3E, 1, 0x3D], 2);
+        assert_eq!(cpu.reg.a, 0); assert!(cpu.reg.flag(FLAG_Z)); assert!(cpu.reg.flag(FLAG_N));
+    }
+    #[test] fn ld_hl_and_store() {
+        let (cpu, mut bus) = run(&[0x21, 0x00, 0xC0, 0x3E, 42, 0x77], 3);
+        assert_eq!(cpu.reg.hl(), 0xC000); assert_eq!(bus.read(0xC000), 42);
+    }
+    #[test] fn load_from_hl() {
+        // LD HL,C123 / LD (HL),99 / LD A,(HL)：写进去再读回来
+        let (cpu, mut bus) = run(&[0x21, 0x23, 0xC1, 0x36, 99, 0x7E], 3);
+        assert_eq!(bus.read(0xC123), 99);
+        assert_eq!(cpu.reg.a, 99);
+    }
+    #[test] fn jp_absolute() {
+        let (cpu, _) = run(&[0xC3, 0x34, 0x12], 1);
+        assert_eq!(cpu.pc, 0x1234);
+    }
+    #[test] fn jr_forward_and_back() {
+        let (cpu, _) = run(&[0x18, 0x02], 1); assert_eq!(cpu.pc, 0x0104);
+        let (cpu, _) = run(&[0x18, 0xFE], 1); assert_eq!(cpu.pc, 0x0100);
+    }
+    #[test] fn jr_nz_conditional() {
+        let (cpu, _) = run(&[0x3E, 1, 0x3D, 0x20, 0x05], 3); assert_eq!(cpu.pc, 0x0105);
+        let (cpu, _) = run(&[0x3E, 2, 0x3D, 0x20, 0x05], 3); assert_eq!(cpu.pc, 0x010A);
+    }
+    #[test] fn loop_countdown() {
+        let (cpu, _) = run(&[0x3E, 3, 0x3D, 0x20, 0xFD, 0x76], 20);
+        assert_eq!(cpu.reg.a, 0); assert!(cpu.halted); assert_eq!(cpu.pc, 0x0106);
+    }
+    #[test] fn halt_stops_pc() {
+        let (mut cpu, mut bus) = run(&[0x76, 0x3E, 0xFF], 1);
+        let pc = cpu.pc;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.pc, pc); assert_eq!(cpu.reg.a, 0x01);
+    }
+
+    // ===== 批次2 新测试 =====
+    #[test] fn ld_matrix() {
+        // LD B,42 / LD C,B / LD D,C / LD A,D —— 接力搬运
+        let (cpu, _) = run(&[0x06, 42, 0x48, 0x51, 0x7A], 4);
+        assert_eq!(cpu.reg.a, 42);
+    }
+    #[test] fn ld_via_hl_matrix() {
+        // LD HL,C000 / LD (HL),77 用矩阵码 0x36 / LD A,(HL) 用 0x7E
+        let (cpu, mut bus) = run(&[0x21, 0x00, 0xC0, 0x36, 77, 0x7E], 3);
+        assert_eq!(bus.read(0xC000), 77); assert_eq!(cpu.reg.a, 77);
+    }
+    #[test] fn and_or_xor() {
+        // A=0F AND 3C → 0C；OR 30 → 3C；XOR FF → C3
+        let (cpu, _) = run(&[0x3E, 0x0F, 0xE6, 0x3C, 0xF6, 0x30, 0xEE, 0xFF], 4);
+        assert_eq!(cpu.reg.a, 0xC3);
+        assert!(!cpu.reg.flag(FLAG_C)); assert!(!cpu.reg.flag(FLAG_H));
+    }
+    #[test] fn and_sets_h() {
+        let (cpu, _) = run(&[0x3E, 0xFF, 0xE6, 0x0F], 2);
+        assert_eq!(cpu.reg.a, 0x0F); assert!(cpu.reg.flag(FLAG_H));  // AND 的怪癖
+    }
+    #[test] fn cp_keeps_a() {
+        // CP：A=5 比 10 → 借位 C=1、N=1，但 A 必须还是 5
+        let (cpu, _) = run(&[0x3E, 5, 0xFE, 10], 2);
+        assert_eq!(cpu.reg.a, 5);
+        assert!(cpu.reg.flag(FLAG_C)); assert!(cpu.reg.flag(FLAG_N)); assert!(!cpu.reg.flag(FLAG_Z));
+    }
+    #[test] fn adc_chain() {
+        // 16位加法 0x00FF + 0x0001 用两条8位加法串起来：
+        // A=FF ADD 01 → A=00 C=1；A=00 ADC 00 → A=01（吃进位）
+        let (cpu, _) = run(&[0x3E, 0xFF, 0xC6, 0x01, 0x3E, 0x00, 0xCE, 0x00], 4);
+        assert_eq!(cpu.reg.a, 1); assert!(!cpu.reg.flag(FLAG_C));
+    }
+    #[test] fn sbc_borrow() {
+        // A=00 SUB 01 → FF C=1；A=01 SBC 00 → 00（再借一次）
+        let (cpu, _) = run(&[0x3E, 0x00, 0xD6, 0x01, 0x3E, 0x01, 0xDE, 0x00], 4);
+        assert_eq!(cpu.reg.a, 0); assert!(cpu.reg.flag(FLAG_Z));
+    }
+    #[test] fn push_pop_roundtrip() {
+        let (cpu, _) = run(&[0x01, 0x34, 0x12, 0xC5, 0x01, 0x00, 0x00, 0xC1], 4);
+        assert_eq!(cpu.reg.bc(), 0x1234);   // 推出去再弹回来，值不变
+        assert_eq!(cpu.sp, 0xFFFE);          // SP 回到原位
+    }
+    #[test] fn pop_af_masks_f() {
+        // 推 AF 再弹：F 低4位必须被抹成0
+        let (mut cpu, mut bus) = run(&[0xF5], 1);   // PUSH AF（F=B0）
+        bus.write(cpu.sp, 0xFF);                     // 偷偷把栈里的低字节改成 FF
+        cpu.step(&mut bus);                          // POP AF
+        assert_eq!(cpu.reg.f & 0x0F, 0);
+    }
+    #[test] fn call_ret() {
+        // 主程序 CALL 0150，子程序 LD A,99 / RET
+        let mut bus = Bus::new();
+        let mut cpu = Cpu::new();
+        let prog = [0xCD, 0x50, 0x01, 0x76];
+        bus.mem[0x0100..0x0104].copy_from_slice(&prog);
+        bus.mem[0x0150] = 0x3E; bus.mem[0x0151] = 99; bus.mem[0x0152] = 0xC9;
+        for _ in 0..10 { if cpu.halted { break; } cpu.step(&mut bus); }
+        assert_eq!(cpu.reg.a, 99);
+        assert!(cpu.halted);                 // 回到了主程序的 HALT
+        assert_eq!(cpu.sp, 0xFFFE);          // 栈干净
+    }
+    #[test] fn nested_call() {
+        // 两层嵌套：主→子A(0150)→子B(0160)，验证返程地址层层正确
+        let mut bus = Bus::new();
+        let mut cpu = Cpu::new();
+        bus.mem[0x0100..0x0104].copy_from_slice(&[0xCD, 0x50, 0x01, 0x76]);
+        bus.mem[0x0150..0x0154].copy_from_slice(&[0xCD, 0x60, 0x01, 0xC9]);
+        bus.mem[0x0160..0x0163].copy_from_slice(&[0x3E, 7, 0xC9]);
+        for _ in 0..20 { if cpu.halted { break; } cpu.step(&mut bus); }
+        assert_eq!(cpu.reg.a, 7); assert!(cpu.halted); assert_eq!(cpu.sp, 0xFFFE);
+    }
+    #[test] fn conditional_call_ret() {
+        // A=1 DEC → Z=1：CALL NZ 不跳（A还是0），CALL Z 跳去把A改88再 RET Z 回来
+        let mut bus = Bus::new();
+        let mut cpu = Cpu::new();
+        let prog = [0x3E, 1, 0x3D, 0xC4, 0x60, 0x01, 0xCC, 0x60, 0x01, 0x76];
+        bus.mem[0x0100..0x010A].copy_from_slice(&prog);
+        bus.mem[0x0160..0x0163].copy_from_slice(&[0x3E, 88, 0xC8]);  // LD A,88 / RET Z
+        for _ in 0..20 { if cpu.halted { break; } cpu.step(&mut bus); }
+        assert_eq!(cpu.reg.a, 88); assert!(cpu.halted); assert_eq!(cpu.sp, 0xFFFE);
+    }
+    #[test] fn jp_hl() {
+        let (cpu, _) = run(&[0x21, 0x00, 0x02, 0xE9], 2);
+        assert_eq!(cpu.pc, 0x0200);
+    }
+    #[test] fn rst() {
+        let (cpu, mut bus) = run(&[0xCF], 1);   // RST 08
+        assert_eq!(cpu.pc, 0x0008);
+        assert_eq!(bus.read16(cpu.sp), 0x0101);  // 返程地址压栈了
+    }
+    #[test] fn hl_increment_store() {
+        // LD HL,C000 / LD (HL+),A 两次 → 写 C000、C001，HL 前进2
+        let (cpu, mut bus) = run(&[0x21, 0x00, 0xC0, 0x3E, 5, 0x22, 0x3E, 6, 0x22], 5);
+        assert_eq!(bus.read(0xC000), 5); assert_eq!(bus.read(0xC001), 6);
+        assert_eq!(cpu.reg.hl(), 0xC002);
+    }
+    #[test] fn ldh_roundtrip() {
+        let (cpu, mut bus) = run(&[0x3E, 0x77, 0xE0, 0x80, 0x3E, 0x00, 0xF0, 0x80], 4);
+        assert_eq!(bus.read(0xFF80), 0x77); assert_eq!(cpu.reg.a, 0x77);
+    }
+    #[test] fn inc_rr_no_flags() {
+        // 先造 Z=1（A=0），再 INC BC：Z 必须保持
+        let (cpu, _) = run(&[0x3E, 0, 0x97, 0x01, 0xFF, 0xFF, 0x03], 4);
+        // 0x97 = SUB A,A → A=0 Z=1；BC=FFFF INC → 0000 但 Z 不动
+        assert_eq!(cpu.reg.bc(), 0);
+        assert!(cpu.reg.flag(FLAG_Z));
+    }
+    #[test] fn add_hl_carry() {
+        // HL=FFFF ADD HL,BC(0001) → 0000 C=1，Z 不动
+        let (cpu, _) = run(&[0x21, 0xFF, 0xFF, 0x01, 0x01, 0x00, 0x09], 3);
+        assert_eq!(cpu.reg.hl(), 0); assert!(cpu.reg.flag(FLAG_C)); assert!(!cpu.reg.flag(FLAG_N));
+    }
+    #[test] fn cb_swap() {
+        let (cpu, _) = run(&[0x3E, 0xAB, 0xCB, 0x37], 2);
+        assert_eq!(cpu.reg.a, 0xBA); assert!(!cpu.reg.flag(FLAG_C));
+    }
+    #[test] fn cb_rl_through_carry() {
+        // SCF 置 C=1；A=80 RL → 01（最高位进C，旧C补最低位），C=1
+        let (cpu, _) = run(&[0x37, 0x3E, 0x80, 0xCB, 0x17], 3);
+        assert_eq!(cpu.reg.a, 0x01); assert!(cpu.reg.flag(FLAG_C));
+    }
+    #[test] fn cb_bit_set_res() {
+        // A=00：BIT 0 → Z=1；SET 0 → A=01；RES 0 → A=00
+        let (cpu, _) = run(&[0x3E, 0x00, 0xCB, 0x47, 0xCB, 0xC7, 0xCB, 0x87], 4);
+        assert_eq!(cpu.reg.a, 0x00);
+    }
+    #[test] fn cb_bit_z_flag() {
+        let (cpu, _) = run(&[0x3E, 0x00, 0xCB, 0x47], 2);  // BIT 0,A：位是0→Z=1
+        assert!(cpu.reg.flag(FLAG_Z)); assert!(cpu.reg.flag(FLAG_H));
+        let (cpu, _) = run(&[0x3E, 0x01, 0xCB, 0x47], 2);  // 位是1→Z=0
+        assert!(!cpu.reg.flag(FLAG_Z));
+    }
+    #[test] fn daa_after_bcd_add() {
+        // BCD 15 + 27：十六进制加法得 3C，DAA 修成 42
+        let (cpu, _) = run(&[0x3E, 0x15, 0x06, 0x27, 0x80, 0x27], 4);
+        assert_eq!(cpu.reg.a, 0x42);
+    }
+    #[test] fn cpl_scf_ccf() {
+        let (cpu, _) = run(&[0x3E, 0x0F, 0x2F, 0x37, 0x3F], 4);
+        assert_eq!(cpu.reg.a, 0xF0);          // 取反
+        assert!(!cpu.reg.flag(FLAG_C));        // SCF置1再CCF翻回0
+    }
+    #[test] fn add_sp_signed() {
+        // SP=FFFE ADD SP,-2 → FFFC
+        let (cpu, _) = run(&[0xE8, 0xFE], 1);
+        assert_eq!(cpu.sp, 0xFFFC);
+        assert!(!cpu.reg.flag(FLAG_Z)); assert!(!cpu.reg.flag(FLAG_N));
+    }
+    #[test] fn ld_hl_sp_plus_n() {
+        let (cpu, _) = run(&[0xF8, 0x02], 1);
+        assert_eq!(cpu.reg.hl(), 0x0000);   // FFFE + 2 = 10000 绕回 0000
+        assert!(cpu.reg.flag(FLAG_C));       // 低字节 FE+02 进位
+    }
+    #[test] fn ld_nn_sp() {
+        let (_cpu, mut bus) = run(&[0x08, 0x00, 0xC0], 1);
+        assert_eq!(bus.read16(0xC000), 0xFFFE);
+    }
+}
