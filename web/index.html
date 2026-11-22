@@ -247,8 +247,8 @@ class Apu {
   pushSample(v){
     v=Math.max(-1,Math.min(1,v));
     if(!this.audioBuf) return;
-    if(this.audioPos>=this.audioBuf.length) return;   // 缓冲写满就停（1 秒环形）
-    this.audioBuf[this.audioPos++]=v;
+    this.audioBuf[this.audioPos]=v;
+    this.audioPos=(this.audioPos+1)%this.audioBuf.length;   // 环形覆盖写，不因写满而停
   }
   // 启动音频（需在用户手势里调用，浏览器才放行）
   initAudio(){
@@ -260,6 +260,7 @@ class Apu {
     const src=ctx.createBufferSource();
     src.buffer=buf; src.loop=true; src.connect(ctx.destination); src.start();
     this.audio=ctx;
+    if(ctx.state==="suspended") ctx.resume();   // 部分浏览器要求显式 resume
   }
   read(addr){
     switch(addr){
