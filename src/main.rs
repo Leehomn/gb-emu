@@ -10,6 +10,8 @@
 
 mod ppu;
 use ppu::Ppu;
+mod apu;
+use apu::Apu;
 
 // ---------- 标志位（F 寄存器高 4 位） ----------
 const FLAG_Z: u8 = 0x80;   // 结果为 0
@@ -75,6 +77,8 @@ pub struct Bus {
     pub joypad_btn: u8,       // 功能键状态（bit0~3 = A B Select Start，0=按下）
     pub joy_reads: u64,       // 诊断：游戏读了多少次手柄
     pub joy_log: Vec<(u64, u8, u8)>,  // 诊断：(第几次读, 选择位, 返回值) 最近几次
+    pub apu_writes: Vec<(u16, u8)>,   // 诊断：游戏写过哪些 APU 寄存器（值）
+    pub apu: Apu,             // 发声芯片（最小闭环版）
 }
 // 卡带头 0x149 字节 → SRAM 大小（字节）
 fn ram_size_for(header: &[u8]) -> usize {
@@ -101,6 +105,8 @@ impl Bus {
             ramg: false, bank1: 1, bank2: 0, mode: false, multicart: false,
             serial_out: String::new(), div_acc: 0, tac: 0, tima_acc: 0,
             joypad_dir: 0x0F, joypad_btn: 0x0F, joy_reads: 0, joy_log: Vec::new(),
+            apu_writes: Vec::new(),
+            apu: Apu::new(),
         };
         b.mem[0xFF44] = 0x00;   // LY：现在由 PPU 真正驱动，不再谎报
         b
@@ -109,6 +115,7 @@ impl Bus {
         match addr {
             0x0000..=0x7FFF => self.read_rom(addr),
             0xA000..=0xBFFF => self.read_ram(addr),
+            0xFF10..=0xFF3F => self.apu.read(addr),
             0xFF00 => {
                 // Joypad 读：bit4/5 是选择线（0=选中），返回低4位按键状态（0=按下）
                 let sel = self.mem[0xFF00];
@@ -167,6 +174,7 @@ impl Bus {
             0x4000..=0x5FFF => { if is_mbc1 { self.bank2 = val & 0x03; } return; }        // 高2位 bank
             0x6000..=0x7FFF => { if is_mbc1 { self.mode = val & 1 != 0; } return; }       // 模式位
             0xA000..=0xBFFF => { self.write_ram(addr, val); return; }                     // SRAM 写（要开锁）
+            0xFF10..=0xFF3F => { self.apu.write(addr, val); self.apu_writes.push((addr, val)); return; }  // 音频寄存器
             _ => {}
         }
         match addr {
@@ -197,6 +205,7 @@ impl Bus {
     }
     // 每走 t 个周期调一次：DIV/TIMA 按真实时间走（你 CHIP-8 批次④的教训！）
     pub fn tick(&mut self, t: u32) {
+        self.apu.tick(t);
         // DIV：每 256 周期 +1
         self.div_acc += t;
         while self.div_acc >= 256 {
@@ -725,6 +734,20 @@ fn main() {
     // --play = 实时窗口玩：cargo run --release -- roms/<游戏>.gb --play
     // 不带参数 = CALL/RET 小演示
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--tone") {
+        // 试音：直接触发方波1，跑 1 秒写成 WAV，肉耳验证 APU 发声
+        let mut apu = Apu::new();
+        apu.write(0xFF26, 0x80);   // 电源开
+        apu.write(0xFF24, 0x77);   // 主音量 7/7
+        apu.write(0xFF25, 0x11);   // ch1 → 左右
+        apu.write(0xFF12, 0xF1);   // 音量15 递减 周期1 DAC开
+        apu.write(0xFF13, 0x00);   // 频率低8位=0（最高音）
+        apu.write(0xFF14, 0x80);   // 触发
+        apu.tick(4_194_304);
+        apu::write_wav(&apu.samples, "tone.wav").expect("写 tone.wav 失败");
+        println!("试音已存 tone.wav（{} 样本 ≈1 秒），用播放器听听", apu.samples.len());
+        return;
+    }
     if args.iter().any(|a| a == "--play") {
         let rom_path = args.iter().find(|a| a.ends_with(".gb")).expect("要指定 ROM 文件");
         play(rom_path);
@@ -737,6 +760,7 @@ fn main() {
         let mut cpu = Cpu::new();
         let mut ppu = Ppu::new();
         let screenshot = args.iter().position(|a| a == "--screenshot").map(|i| args[i + 1].clone());
+        let wav_out = args.iter().position(|a| a == "--wav").map(|i| args[i + 1].clone());
         let frames_limit: u64 = if screenshot.is_some() { u64::MAX } else { u64::MAX };
         println!("考卷开跑：{}（{} 字节）", args[1], rom.len());
         let mut last_len = 0usize;
@@ -744,10 +768,21 @@ fn main() {
         let mut frames = 0u64;
         let mut prev_ly = 0u8;
         let press_start = args.iter().any(|a| a == "--press-start");   // 诊断：自动按Start
+        let press_dir = args.iter().any(|a| a == "--press-dir");       // 诊断：周期性乱按方向键（触发游戏声音）
         for _i in 0..500_000_000u64 {
             // 诊断脚本：第30~40帧按住 Start（Enter 对应的键位）
             if press_start {
                 if frames >= 30 && frames < 40 { bus.joypad_btn &= !0x08; } else { bus.joypad_btn |= 0x08; }
+            }
+            // 诊断：每 20 帧轮换按一个方向键（右/下/左/上循环），触发移动/合并声音
+            if press_dir && frames >= 40 {
+                bus.joypad_dir = 0x0F;
+                match (frames / 20) % 4 {
+                    0 => bus.joypad_dir &= !0x01,   // 右
+                    1 => bus.joypad_dir &= !0x08,   // 下
+                    2 => bus.joypad_dir &= !0x02,   // 左
+                    _ => bus.joypad_dir &= !0x04,   // 上
+                }
             }
             let t = cpu.step(&mut bus);
             ppu.tick(t, &mut bus);
@@ -760,6 +795,7 @@ fn main() {
             }
             if frames >= frames_limit { break; }
             if press_start && frames >= 80 { break; }   // 诊断：按完Start再跑40帧就停
+            if press_dir && frames >= 40 + 80 { break; }   // 诊断：乱按方向键跑够 80 帧就停
             if bus.serial_out.contains("Passed") || bus.serial_out.contains("Failed") {
                 if screenshot.is_none() { break; }
             }
@@ -783,6 +819,20 @@ fn main() {
             }
             save_ppm(&path, &ppu.framebuffer);
             println!("截图已存：{}", path);
+        }
+        if let Some(path) = wav_out {
+            let count = bus.apu.samples.len();
+            apu::write_wav(&bus.apu.samples, &path).expect("写 WAV 失败");
+            println!("音频已存：{}（{} 个样本，约 {:.1} 秒）", path, count, count as f64 / 44100.0);
+            // 诊断：游戏写过的 APU 寄存器（去重后按地址排序）
+            let mut seen = std::collections::BTreeSet::new();
+            let mut writes: Vec<(u16, u8)> = Vec::new();
+            for &(a, v) in &bus.apu_writes { if seen.insert(a) { writes.push((a, v)); } }
+            writes.sort();
+            println!("游戏写过的 APU 寄存器（{} 个）：", writes.len());
+            for (a, v) in writes { println!("  {a:04X} ← {v:02X}"); }
+            let nz = bus.apu.samples.iter().filter(|&&s| s != 0).count();
+            println!("非零样本：{nz} / {count}");
         }
         let lines: Vec<&str> = bus.serial_out.lines().collect();
         let start = if lines.len() > 20 { lines.len() - 20 } else { 0 };
@@ -1228,5 +1278,15 @@ mod tests {
             let result = run_mooneye(&format!("roms_mbc/{name}"));
             assert_eq!(result, Some(3), "Mooneye {name} 失败：result={result:?}");
         }
+    }
+
+    // ===== APU 接线验证：CPU 执行 → 总线 → APU 是否连通 =====
+    #[test]
+    fn apu_wired_through_bus() {
+        // 程序：LD A,0x80 / LDH(0x26),A  —— 写 NR52 电源开
+        let (cpu, bus) = run(&[0x3E, 0x80, 0xE0, 0x26], 2);
+        assert_eq!(cpu.reg.a, 0x80);
+        assert_eq!(bus.apu_writes.len(), 1, "总线应记录 1 次 APU 写");
+        assert_eq!(bus.apu_writes[0], (0xFF26, 0x80), "写的是 NR52=0x80");
     }
 }
