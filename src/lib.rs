@@ -76,6 +76,10 @@ pub struct Bus {
     pub bank2: u8,            // 高 2 位 bank 号（写 0x4000~0x5FFF）
     pub mode: bool,           // 模式位（写 0x6000~0x7FFF）：true=高级换页
     pub multicart: bool,      // 是否 multicart（特殊接线）
+    pub rom_bank: u16,        // MBC3/MBC5 当前 ROM bank（MBC3:1-127, MBC5:0-511）
+    pub ram_bank: u8,         // MBC3/MBC5 当前 RAM bank（MBC3:0-3 或 8-12=RTC 寄存器, MBC5:0-15）
+    pub rtc: [u8; 5],         // MBC3 RTC 寄存器（秒/分/时/日低8位/日高1位+停止+进位）
+    pub rtc_latch_pre: bool,  // MBC3 RTC 锁存：上一次写 0x6000 区是否为 0
     pub serial_out: String,   // 考卷成绩单收集处
     pub div_acc: u32,         // DIV 分频累加器（每周期+1，满256归零并让DIV+1）
     pub tac: u8,              // 定时器控制（低3位有效）
@@ -110,6 +114,7 @@ impl Bus {
             mem: vec![0; 0x10000],
             cart: Vec::new(), ram: Vec::new(), mbc_type: 0,
             ramg: false, bank1: 1, bank2: 0, mode: false, multicart: false,
+            rom_bank: 1, ram_bank: 0, rtc: [0; 5], rtc_latch_pre: false,
             serial_out: String::new(), div_acc: 0, tac: 0, tima_acc: 0,
             joypad_dir: 0x0F, joypad_btn: 0x0F, joy_reads: 0, joy_log: Vec::new(),
             apu_writes: Vec::new(),
@@ -143,13 +148,21 @@ impl Bus {
             _ => self.mem[addr as usize],
         }
     }
-    // MBC1 换页核心：算「低 bank」和「高 bank」两个窗口各落在 ROM 的哪个偏移
+    fn is_mbc3(&self) -> bool { matches!(self.mbc_type, 0x0F | 0x10 | 0x11 | 0x12 | 0x13) }
+    fn is_mbc5(&self) -> bool { matches!(self.mbc_type, 0x19 | 0x1A | 0x1B | 0x1C | 0x1D | 0x1E) }
+    // 换页核心：算「低 bank」和「高 bank」两个窗口各落在 ROM 的哪个偏移
     fn rom_offsets(&self) -> (usize, usize) {
-        let upper_bits = if self.multicart { (self.bank2 as usize) << 4 } else { (self.bank2 as usize) << 5 };
-        let lower_bits = if self.multicart { (self.bank1 & 0x0F) as usize } else { self.bank1 as usize };
-        let lower_bank = if self.mode { upper_bits } else { 0 };   // mode=1 时低窗口也能被 bank2 顶走
-        let upper_bank = upper_bits | lower_bits;
-        (0x4000 * lower_bank, 0x4000 * upper_bank)
+        if self.is_mbc3() || self.is_mbc5() {
+            // MBC3/MBC5：低窗口(0x0000-0x3FFF)永远 bank0，高窗口(0x4000-0x7FFF)由 rom_bank 决定
+            (0, (self.rom_bank as usize) * 0x4000)
+        } else {
+            // MBC1
+            let upper_bits = if self.multicart { (self.bank2 as usize) << 4 } else { (self.bank2 as usize) << 5 };
+            let lower_bits = if self.multicart { (self.bank1 & 0x0F) as usize } else { self.bank1 as usize };
+            let lower_bank = if self.mode { upper_bits } else { 0 };   // mode=1 时低窗口也能被 bank2 顶走
+            let upper_bank = upper_bits | lower_bits;
+            (0x4000 * lower_bank, 0x4000 * upper_bank)
+        }
     }
     fn read_rom(&self, addr: u16) -> u8 {
         if self.cart.is_empty() { return 0xFF; }
@@ -159,15 +172,28 @@ impl Bus {
         self.cart[off & (self.cart.len() - 1)]
     }
     fn ram_addr(&self, addr: u16) -> usize {
-        let off = if self.mode { (self.bank2 as usize) * 0x2000 } else { 0 };
+        let off = if self.is_mbc3() || self.is_mbc5() {
+            (self.ram_bank as usize) * 0x2000                          // MBC3/MBC5：RAM bank 直接作偏移
+        } else if self.mode {
+            (self.bank2 as usize) * 0x2000                             // MBC1 高级模式
+        } else { 0 };
         (off | (addr as usize & 0x1FFF)) & (self.ram.len() - 1)
     }
     fn read_ram(&self, addr: u16) -> u8 {
-        if self.ram.is_empty() || !self.ramg { return 0xFF; }   // 没开锁读到的就是垃圾
+        if !self.ramg { return 0xFF; }   // 没开锁读到的就是垃圾
+        if self.is_mbc3() && (0x08..=0x0C).contains(&self.ram_bank) {
+            return self.rtc[(self.ram_bank - 0x08) as usize];   // MBC3 把 0xA000 窗口映射到 RTC 寄存器
+        }
+        if self.ram.is_empty() { return 0xFF; }
         self.ram[self.ram_addr(addr)]
     }
     fn write_ram(&mut self, addr: u16, val: u8) {
-        if !self.ram.is_empty() && self.ramg {
+        if !self.ramg { return; }
+        if self.is_mbc3() && (0x08..=0x0C).contains(&self.ram_bank) {
+            self.rtc[(self.ram_bank - 0x08) as usize] = val;   // MBC3 写 RTC 寄存器
+            return;
+        }
+        if !self.ram.is_empty() {
             let idx = self.ram_addr(addr);
             self.ram[idx] = val;
         }
@@ -175,11 +201,47 @@ impl Bus {
     pub fn write(&mut self, addr: u16, val: u8) {
         // 卡带区写入 = MBC 命令（不是真往 ROM 写，是给换页芯片下指令）
         let is_mbc1 = matches!(self.mbc_type, 0x01 | 0x02 | 0x03);
+        let is_mbc3 = self.is_mbc3();
+        let is_mbc5 = self.is_mbc5();
         match addr {
-            0x0000..=0x1FFF => { if is_mbc1 { self.ramg = val & 0x0F == 0x0A; } return; }  // RAM 使能：低4位=0xA 开锁
-            0x2000..=0x3FFF => { if is_mbc1 { self.bank1 = val & 0x1F; if self.bank1 == 0 { self.bank1 = 1; } } return; }  // 低5位 bank，0 强制为 1
-            0x4000..=0x5FFF => { if is_mbc1 { self.bank2 = val & 0x03; } return; }        // 高2位 bank
-            0x6000..=0x7FFF => { if is_mbc1 { self.mode = val & 1 != 0; } return; }       // 模式位
+            0x0000..=0x1FFF => {
+                if is_mbc1 || is_mbc3 || is_mbc5 { self.ramg = val & 0x0F == 0x0A; }   // RAM/RTC 使能：低4位=0xA 开锁
+                return;
+            }
+            0x2000..=0x3FFF => {
+                if is_mbc1 {
+                    self.bank1 = val & 0x1F; if self.bank1 == 0 { self.bank1 = 1; }    // 低5位 bank，0 强制为 1
+                } else if is_mbc3 {
+                    self.rom_bank = (val & 0x7F) as u16; if self.rom_bank == 0 { self.rom_bank = 1; }  // 7位 bank，0 强制为 1
+                } else if is_mbc5 {
+                    // MBC5 9 位 bank：0x2000-0x2FFF 写低 8 位，0x3000-0x3FFF 写第 9 位
+                    if addr < 0x3000 {
+                        self.rom_bank = (self.rom_bank & 0x100) | (val as u16);
+                    } else {
+                        self.rom_bank = (self.rom_bank & 0x0FF) | (((val as u16) & 1) << 8);
+                    }
+                }
+                return;
+            }
+            0x4000..=0x5FFF => {
+                if is_mbc1 {
+                    self.bank2 = val & 0x03;                                             // 高2位 bank
+                } else if is_mbc3 || is_mbc5 {
+                    self.ram_bank = val & 0x0F;                                          // MBC3:0-3=RAM,8-12=RTC / MBC5:0-15=RAM
+                }
+                return;
+            }
+            0x6000..=0x7FFF => {
+                if is_mbc1 {
+                    self.mode = val & 1 != 0;                                            // 模式位
+                } else if is_mbc3 {
+                    // RTC 锁存：先写 0x00 再写 0x01 才把当前时间快照进寄存器（暂不实现真 RTC 走时）
+                    if self.rtc_latch_pre && val == 0x01 { /* 快照占位 */ }
+                    self.rtc_latch_pre = val == 0x00;
+                }
+                // MBC5 无模式位/锁存，写此区间忽略
+                return;
+            }
             0xA000..=0xBFFF => { self.write_ram(addr, val); return; }                     // SRAM 写（要开锁）
             0xFF10..=0xFF3F => { self.apu.write(addr, val); self.apu_writes.push((addr, val)); return; }  // 音频寄存器
             _ => {}
@@ -252,6 +314,10 @@ impl Bus {
         self.bank2 = 0;
         self.mode = false;
         self.multicart = is_mbc1_multicart(&self.cart);
+        self.rom_bank = 1;
+        self.ram_bank = 0;
+        self.rtc = [0; 5];
+        self.rtc_latch_pre = false;
     }
     // 把 SRAM 存档落盘为 .sav 文件（测试后调用验证持久化）
     pub fn save_sram(&self, path: &str) -> std::io::Result<()> {
@@ -1052,6 +1118,79 @@ mod tests {
             let result = run_mooneye(&format!("roms_mbc/{name}"));
             assert_eq!(result, Some(3), "Mooneye {name} 失败：result={result:?}");
         }
+    }
+
+    #[test] fn mooneye_mbc5_all() {
+        let roms = [
+            "rom_512kb.gb", "rom_1Mb.gb", "rom_2Mb.gb", "rom_4Mb.gb",
+            "rom_8Mb.gb", "rom_16Mb.gb", "rom_32Mb.gb", "rom_64Mb.gb",
+        ];
+        for name in roms {
+            let result = run_mooneye(&format!("roms_mbc5/{name}"));
+            assert_eq!(result, Some(3), "Mooneye {name} 失败：result={result:?}");
+        }
+    }
+
+    // MBC5 单元测试：9 位 ROM bank（0x2000-0x2FFF 低8位 / 0x3000-0x3FFF 第9位）+ RAM bank 换页
+    #[test] fn mbc5_bank_switch() {
+        let mut bus = Bus::new();
+        bus.cart = vec![0xAA; 0x4000 * 300];   // 300 个 bank，超 256 验证第 9 位
+        bus.mbc_type = 0x19;                    // MBC5 无 RAM
+        bus.ram = vec![0; 8192];
+        assert_eq!(bus.read(0x0000), 0xAA);
+        bus.write(0x2000, 0x42);                // 低 8 位切到 bank 0x42
+        assert_eq!(bus.read(0x4000), 0xAA);     // 内容相同无法区分，改验 rom_bank
+        assert_eq!(bus.rom_bank, 0x42);
+        bus.write(0x3000, 0x01);                // 第 9 位置 1 → bank 0x142
+        assert_eq!(bus.rom_bank, 0x142);
+        // 高低位分离写不互相覆盖
+        bus.write(0x2000, 0xFF);
+        assert_eq!(bus.rom_bank, 0x1FF);
+        bus.write(0x3000, 0x00);
+        assert_eq!(bus.rom_bank, 0x0FF);
+    }
+
+    #[test] fn mbc5_ram_bank_switch() {
+        let mut bus = Bus::new();
+        bus.cart = vec![0; 0x8000];
+        bus.mbc_type = 0x1A;                     // MBC5+RAM
+        bus.ram = vec![0; 0x8000];               // 4 个 8KB RAM bank
+        bus.write(0x0000, 0x0A);                 // 开锁
+        bus.write(0x4000, 0x02);                 // 选 RAM bank 2
+        assert_eq!(bus.ram_bank, 2);
+        bus.write(0xA000, 0x7E);
+        assert_eq!(bus.ram[0x4000], 0x7E);       // 落在第 2 个 8KB bank 首字节
+        assert_eq!(bus.read(0xA000), 0x7E);
+    }
+
+    // MBC3 单元测试：7 位 ROM bank + RTC 寄存器映射（无真 RTC 走时，只验换页与映射）
+    #[test] fn mbc3_bank_switch() {
+        let mut bus = Bus::new();
+        bus.cart = vec![0xAA; 0x4000 * 128];
+        bus.mbc_type = 0x13;                     // MBC3+RAM+Battery
+        bus.ram = vec![0; 8192];
+        bus.write(0x2000, 0x7F);                 // 最大 7 位 bank
+        assert_eq!(bus.rom_bank, 0x7F);
+        bus.write(0x2000, 0x80);                 // 0x80 & 0x7F = 0，同一次写内强制回 1
+        assert_eq!(bus.rom_bank, 1);
+        bus.write(0x2000, 0x00);                 // 写 0 也强制回 1
+        assert_eq!(bus.rom_bank, 1);
+    }
+
+    #[test] fn mbc3_rtc_register_mapping() {
+        let mut bus = Bus::new();
+        bus.cart = vec![0; 0x8000];
+        bus.mbc_type = 0x0F;                     // MBC3+TIMER+BATTERY
+        bus.ram = vec![0; 8192];
+        bus.write(0x0000, 0x0A);                 // 开锁
+        bus.write(0x4000, 0x08);                 // 选 RTC 寄存器 0（秒）
+        assert_eq!(bus.ram_bank, 0x08);
+        bus.write(0xA000, 0x2A);                 // 写 RTC 秒寄存器
+        assert_eq!(bus.rtc[0], 0x2A);
+        assert_eq!(bus.read(0xA000), 0x2A);
+        bus.write(0x4000, 0x0C);                 // 选 RTC 寄存器 4（日高8位）
+        bus.write(0xA000, 0x01);
+        assert_eq!(bus.rtc[4], 0x01);
     }
 
     // ===== APU 接线验证：CPU 执行 → 总线 → APU 是否连通 =====
