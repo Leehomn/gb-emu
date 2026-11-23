@@ -343,10 +343,6 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
 }
 .play-error p{margin:0;color:var(--muted);font-size:14px;max-width:38ch;}
 .play-error code{font-size:10px;color:var(--screen-2);}
-.screen-toolbar{
-  display:flex;gap:10px;justify-content:flex-end;
-  padding:10px 12px;border-top:1px solid var(--border);
-}
 .play-note{max-width:560px;margin:14px auto 0;font-size:13px;color:var(--muted);text-align:center;}
 .noscript-note{color:var(--danger);text-align:center;font-size:14px;margin:14px 0 0;}
 
@@ -454,7 +450,7 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
 }
 @media print{
   body::before{display:none;}
-  .site-header,.hero-cta,.screen-toolbar{display:none;}
+  .site-header,.hero-cta{display:none;}
   body{background:#fff;color:#111;}
 }
 </style>
@@ -574,10 +570,6 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
           </div>
 
           <noscript><p class="noscript-note">游玩区需要启用 JavaScript；其余内容不受影响。</p></noscript>
-        </div>
-        <div class="screen-toolbar" id="playToolbar" hidden>
-          <button class="btn-mini" id="btnReload" type="button">重新加载</button>
-          <button class="btn-mini" id="btnFull" type="button">全屏</button>
         </div>
       </div>
 
@@ -771,11 +763,8 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
   var loading = $('#playLoading');
   var loadSlow = $('#loadSlow');
   var errorBox = $('#playError');
-  var toolbar = $('#playToolbar');
   var btnStart = $('#btnStart');
   var btnRetry = $('#btnRetry');
-  var btnReload = $('#btnReload');
-  var btnFull = $('#btnFull');
   var frame = null;
   var slowTimer = null;
 
@@ -792,7 +781,6 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
     clearSlow();
     show(loading, false);
     show(cover, false);
-    show(toolbar, false);
     if (frame) { frame.remove(); frame = null; }
     if (btnStart) { btnStart.disabled = false; }
     show(errorBox, true); /* role=alert 自动播报 */
@@ -811,7 +799,6 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
       clearSlow();
       show(loading, false);
       show(cover, false);
-      show(toolbar, true);
       try { frame.focus(); } catch (e) { /* 跨域焦点失败可忽略 */ }
     });
     frame.addEventListener('error', fail);
@@ -835,31 +822,6 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
 
   if (btnStart) { btnStart.addEventListener('click', start); }
   if (btnRetry) { btnRetry.addEventListener('click', start); }
-  if (btnReload) {
-    btnReload.addEventListener('click', function () {
-      if (frame) {
-        clearSlow();
-        show(loading, true);
-        slowTimer = window.setTimeout(function () { show(loadSlow, true); }, 15000);
-        frame.src = EMU_PATH;
-        try { frame.focus(); } catch (e) {}
-      }
-    });
-  }
-  if (btnFull) {
-    if (!document.fullscreenEnabled) {
-      btnFull.hidden = true;
-    } else {
-      btnFull.addEventListener('click', function () {
-        var box = $('.screen-frame');
-        if (document.fullscreenElement) {
-          document.exitFullscreen();
-        } else if (box.requestFullscreen) {
-          box.requestFullscreen();
-        }
-      });
-    }
-  }
 })();
 </script>
 </body>
