@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>RustBoy · 用 Rust 从零写的 Game Boy 模拟器</title>
 <meta name="description" content="用 Rust 从零实现的 Game Boy 模拟器：CPU、中断、定时器、PPU 全部手写，Blargg 指令测试 75/75 通过，打开网页就能玩 2048 和扫雷。">
-<meta name="theme-color" content="#0c110d">
+<meta name="theme-color" content="#07060f">
 <meta name="color-scheme" content="dark">
 <meta property="og:title" content="RustBoy · 用 Rust 从零写的 Game Boy 模拟器">
 <meta property="og:description" content="CPU、中断、定时器、PPU 全部手写，Blargg 75/75 通过——浏览器里直接玩 2048 和扫雷。">
@@ -24,22 +24,24 @@
 -->
 <style>
 /* ============================================================
-   1. 设计令牌 —— DMG 掌机色板 × 深色像素风
+   1. 设计令牌 —— 霓虹夜城色板 × DMG 屏幕绿（绿色只保留给屏幕区）
    ============================================================ */
 :root{
-  --bg:#0c110d;               /* 近黑带绿，非纯黑 */
-  --bg-deep:#0a0f0b;
-  --surface:#131b15;
-  --surface-2:#18231b;
-  --fg:#dfe8d8;               /* 米白偏绿，非纯白 */
-  --muted:#8fa08c;
-  --border:rgba(223,232,216,.14);
-  --border-strong:rgba(223,232,216,.32);
-  --accent:#9bbc0f;           /* DMG 最亮绿：只给关键动作 */
-  --accent-press:#82a00c;
-  --ink:#0c110d;
-  --danger:#e0644f;
-  --screen-0:#0f380f;         /* DMG 屏幕四阶绿 */
+  --bg:#07060f;               /* 紫黑夜幕，非纯黑 */
+  --bg-deep:#050409;
+  --surface:#12101f;          /* 暗紫玻璃面板 */
+  --surface-2:#1a1630;
+  --fg:#ece9fa;               /* 近白偏紫，非纯白 */
+  --muted:#9a92b8;
+  --border:rgba(190,170,255,.13);
+  --border-strong:rgba(190,170,255,.34);
+  --accent:#00f0ff;           /* 霓虹青：只给关键动作 */
+  --accent-press:#53f5ff;
+  --neon-mag:#ff2ea6;         /* 霓虹粉 */
+  --neon-vio:#b26bff;         /* 霓虹紫 */
+  --ink:#07060f;
+  --danger:#ff3d81;
+  --screen-0:#0f380f;         /* DMG 屏幕四阶绿：仅屏幕/终端/截图区使用 */
   --screen-1:#306230;
   --screen-2:#8bac0f;
   --screen-3:#9bbc0f;
@@ -47,7 +49,8 @@
   --font-body:-apple-system,BlinkMacSystemFont,'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',sans-serif;
   --container:1080px;
   --header-h:64px;
-  --shadow-hard:6px 6px 0 rgba(4,8,5,.55);
+  --shadow-hard:6px 6px 0 rgba(8,3,20,.6);
+  --hairline-neon:linear-gradient(90deg,transparent,rgba(0,240,255,.45) 22%,rgba(178,107,255,.4) 50%,rgba(255,46,166,.45) 78%,transparent);
 }
 
 /* ============================================================
@@ -64,9 +67,14 @@
 html{scroll-behavior:smooth;scroll-padding-top:calc(var(--header-h) + 16px);}
 body{
   margin:0;
-  background:var(--bg);
-  background-image:radial-gradient(rgba(223,232,216,.045) 1px,transparent 1px);
-  background-size:26px 26px;
+  background-color:var(--bg);
+  background-image:
+    radial-gradient(1100px 520px at 12% -8%, rgba(84,44,178,.24), transparent 62%),
+    radial-gradient(900px 480px at 92% 2%, rgba(255,46,166,.11), transparent 60%),
+    radial-gradient(1200px 560px at 50% 112%, rgba(0,240,255,.09), transparent 64%),
+    radial-gradient(rgba(150,130,255,.08) 1px,transparent 1px);
+  background-size:auto,auto,auto,26px 26px;
+  background-attachment:fixed;
   color:var(--fg);
   font-family:var(--font-body);
   font-size:16px;
@@ -79,12 +87,24 @@ body::before{
   position:fixed;inset:0;z-index:2147483000;
   pointer-events:none;
   background:repeating-linear-gradient(to bottom,
-    rgba(5,9,6,.20) 0 1px,transparent 1px 4px);
-  opacity:.45;
+    rgba(6,3,16,.22) 0 1px,transparent 1px 4px);
+  opacity:.5;
+}
+/* 合成波网格地平线：纯装饰，固定不滚动 */
+body::after{
+  content:"";
+  position:fixed;left:-24%;right:-24%;bottom:-4vh;height:46vh;z-index:2147482900;
+  pointer-events:none;
+  background:
+    repeating-linear-gradient(to top,rgba(0,240,255,.65) 0 1px,transparent 1px 30px),
+    repeating-linear-gradient(to right,rgba(255,46,166,.5) 0 1px,transparent 1px 30px);
+  transform:perspective(320px) rotateX(62deg);
+  transform-origin:50% 100%;
+  opacity:.13;
 }
 img{max-width:100%;}
 [hidden]{display:none !important;}
-::selection{background:var(--screen-1);color:var(--fg);}
+::selection{background:rgba(255,46,166,.42);color:#fff;}
 :focus-visible{outline:3px solid var(--accent);outline-offset:3px;}
 h1,h2,h3{font-weight:700;letter-spacing:.01em;}
 code{font-family:var(--font-pixel);letter-spacing:.04em;}
@@ -107,8 +127,8 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
   font-size:10px;letter-spacing:.22em;
   color:var(--muted);margin:0 0 18px;
 }
-.eyebrow::before{content:"■ ";color:var(--accent);}
-.section{padding:96px 0;border-top:1px solid var(--border);}
+.eyebrow::before{content:"■ ";color:var(--accent);text-shadow:0 0 8px rgba(0,240,255,.6);}
+.section{padding:96px 0;background:var(--hairline-neon) top/100% 1px no-repeat;}
 .section-head{max-width:640px;margin-bottom:44px;}
 .section-head h2{font-size:clamp(24px,3.4vw,32px);margin:0 0 14px;line-height:1.3;}
 .section-sub{color:var(--muted);margin:0;font-size:15.5px;}
@@ -123,17 +143,17 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
 }
 .btn-primary{
   background:var(--accent);color:var(--ink);
-  box-shadow:4px 4px 0 var(--screen-0);
+  box-shadow:4px 4px 0 var(--neon-mag);
 }
-.btn-primary:hover{background:#a8cc1c;}
-.btn-primary:active{transform:translate(3px,3px);box-shadow:1px 1px 0 var(--screen-0);}
+.btn-primary:hover{background:var(--accent-press);box-shadow:4px 4px 0 var(--neon-mag),0 0 22px rgba(0,240,255,.4);}
+.btn-primary:active{transform:translate(3px,3px);box-shadow:1px 1px 0 var(--neon-mag);}
 .btn-ghost{
   background:transparent;color:var(--fg);
-  border-color:var(--border-strong);box-shadow:4px 4px 0 rgba(4,8,5,.5);
+  border-color:var(--border-strong);box-shadow:4px 4px 0 rgba(8,3,20,.55);
 }
-.btn-ghost:hover{background:var(--surface-2);}
-.btn-ghost:active{transform:translate(3px,3px);box-shadow:1px 1px 0 rgba(4,8,5,.5);}
-.btn[disabled]{opacity:.55;cursor:wait;transform:none !important;box-shadow:4px 4px 0 var(--screen-0) !important;}
+.btn-ghost:hover{background:var(--surface-2);border-color:rgba(178,107,255,.55);}
+.btn-ghost:active{transform:translate(3px,3px);box-shadow:1px 1px 0 rgba(8,3,20,.55);}
+.btn[disabled]{opacity:.55;cursor:wait;transform:none !important;box-shadow:4px 4px 0 var(--neon-mag) !important;}
 .btn svg{flex:none;}
 
 /* 小号工具按钮（游玩区工具条） */
@@ -142,7 +162,7 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
   background:transparent;color:var(--muted);
   border:1px solid var(--border-strong);padding:8px 14px;min-height:36px;cursor:pointer;
 }
-.btn-mini:hover{color:var(--fg);background:var(--surface-2);}
+.btn-mini:hover{color:var(--accent);background:var(--surface-2);border-color:rgba(0,240,255,.5);}
 
 /* 滚动显现：一次性，尊重系统减动效 */
 .js .reveal{opacity:0;transform:translateY(16px);transition:opacity .35s ease-out,transform .35s ease-out;}
@@ -153,9 +173,10 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
    ============================================================ */
 .site-header{
   position:sticky;top:0;z-index:100;
-  background:rgba(12,17,13,.9);
+  background-color:rgba(7,6,15,.86);
+  background-image:var(--hairline-neon);
+  background-repeat:no-repeat;background-position:bottom;background-size:100% 1px;
   backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
-  border-bottom:1px solid var(--border);
 }
 .nav{display:flex;align-items:center;justify-content:space-between;height:var(--header-h);}
 .brand{
@@ -169,8 +190,8 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
   padding:10px 14px;color:var(--muted);font-size:14.5px;text-decoration:none;
   border-bottom:2px solid transparent;
 }
-.nav-links a:hover{color:var(--fg);}
-.nav-links a[aria-current]{color:var(--fg);border-bottom-color:var(--accent);}
+.nav-links a:hover{color:var(--accent);}
+.nav-links a[aria-current]{color:var(--fg);border-bottom-color:var(--accent);text-shadow:0 0 10px rgba(0,240,255,.45);}
 
 /* ============================================================
    5. 首页 Hero
@@ -179,36 +200,48 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
 .hero-grid{display:grid;grid-template-columns:1.08fr .92fr;gap:56px;align-items:center;}
 .hero-copy{min-width:0;}
 .hero h1{font-size:clamp(30px,4.6vw,50px);line-height:1.28;margin:0 0 22px;}
+@supports ((-webkit-background-clip:text) or (background-clip:text)){
+  .hero h1{
+    background:linear-gradient(96deg,var(--accent) 4%,var(--neon-vio) 46%,var(--neon-mag) 88%);
+    -webkit-background-clip:text;background-clip:text;
+    color:transparent;
+    filter:drop-shadow(0 0 16px rgba(178,107,255,.3));
+  }
+}
 .hero-sub{color:var(--muted);font-size:16.5px;line-height:1.85;max-width:36em;margin:0 0 6px;}
-.hero-sub b{color:var(--fg);font-weight:700;}
+.hero-sub b{color:var(--accent);font-weight:700;}
 .hero-cta{display:flex;flex-wrap:wrap;gap:18px;margin-top:32px;}
 /* 成绩条：全部为真实数据 */
 .hero-stats{
   display:flex;margin:42px 0 0;padding:0;
   border:2px solid var(--border-strong);background:var(--surface);
-  box-shadow:var(--shadow-hard);
+  box-shadow:var(--shadow-hard),0 0 30px rgba(178,107,255,.1);
 }
 .hero-stats>div{flex:1;padding:16px 18px 14px;min-width:0;}
 .hero-stats>div+div{border-left:2px solid var(--border);}
 .hero-stats dt{
   font-family:var(--font-pixel);font-size:clamp(13px,1.8vw,18px);
-  color:var(--screen-2);margin:0 0 9px;letter-spacing:.02em;white-space:nowrap;
+  color:var(--accent);margin:0 0 9px;letter-spacing:.02em;white-space:nowrap;
+  text-shadow:0 0 12px rgba(0,240,255,.5);
 }
 .hero-stats dd{margin:0;font-size:13px;color:var(--muted);line-height:1.5;}
 
 /* ============================================================
    6. 首页视觉：CSS 手绘 DMG 掌机（签名元素）
    ============================================================ */
-.dmg{--shell:#d6d2c8;--shell-dark:#b3ae9f;--bezel:#4a4658;--bezel-line:#c9c5d6;
-     --btn-dark:#2b2b33;--btn-ab:#a2355f;
+.dmg{--shell:#181233;--shell-dark:#0c0920;--bezel:#0a0818;--bezel-line:#4b3f7d;
+     --btn-dark:#241d45;--btn-ab:var(--neon-mag);
      margin:0;display:flex;justify-content:center;}
 .dmg-shell{
   width:min(320px,74vw);position:relative;
-  background:var(--shell);
-  border:2px solid var(--shell-dark);
+  background:
+    radial-gradient(340px 200px at 18% 0%, rgba(178,107,255,.14), transparent 62%),
+    var(--shell);
+  border:2px solid #362a68;
   border-radius:14px 14px 48px 14px;      /* DMG 标志性的右下大圆角 */
   padding:24px 24px 50px;
-  box-shadow:12px 12px 0 rgba(4,8,5,.5),inset -8px -8px 0 rgba(0,0,0,.05);
+  box-shadow:12px 12px 0 rgba(8,3,20,.6),inset -8px -8px 0 rgba(0,0,0,.22),
+             0 0 36px rgba(178,107,255,.16);
 }
 .dmg-bezel{
   background:var(--bezel);
@@ -227,8 +260,8 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
 .dmg-battery{display:flex;flex-direction:column;align-items:center;gap:7px;padding-top:4px;}
 .dmg-led{
   width:9px;height:9px;border-radius:50%;flex:none;
-  background:var(--accent);
-  box-shadow:0 0 8px rgba(155,188,15,.85),inset -1px -1px 0 rgba(0,0,0,.3);
+  background:var(--neon-mag);
+  box-shadow:0 0 9px rgba(255,46,166,.85),inset -1px -1px 0 rgba(0,0,0,.3);
 }
 .dmg-battery b{
   font-family:var(--font-pixel);font-weight:400;font-size:5px;letter-spacing:.18em;
@@ -237,6 +270,7 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
 .dmg-screen{
   flex:1;aspect-ratio:10/9;position:relative;overflow:hidden;
   background:#7da30d;border:2px solid var(--screen-0);border-radius:3px;
+  box-shadow:inset 0 0 22px rgba(15,56,15,.5);
 }
 .dmg-screen img{
   position:absolute;inset:0;width:100%;height:100%;
@@ -254,7 +288,7 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
 @keyframes blink{50%{opacity:0;}}
 .dmg-logo{
   margin:14px 2px 10px;font-family:var(--font-pixel);
-  font-size:11px;letter-spacing:.06em;color:var(--bezel);
+  font-size:11px;letter-spacing:.06em;color:#a89ede;
 }
 .dmg-logo small{font-size:6px;vertical-align:top;}
 .dmg-controls{display:flex;justify-content:space-between;align-items:center;margin-top:2px;}
@@ -269,12 +303,12 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
 }
 .dmg-dpad i{
   position:absolute;left:23px;top:23px;width:14px;height:14px;border-radius:50%;
-  background:radial-gradient(circle at 40% 35%,#3d3d47,#1e1e25);
+  background:radial-gradient(circle at 40% 35%,#463b7e,#181233);
 }
 .dmg-ab{display:flex;gap:14px;align-items:center;transform:rotate(-24deg);}
 .dmg-ab span{
   width:34px;height:34px;border-radius:50%;
-  background:var(--btn-ab);color:#f2d9e4;
+  background:var(--btn-ab);color:#ffd7ec;
   font-family:var(--font-pixel);font-size:10px;
   display:flex;align-items:center;justify-content:center;
   box-shadow:inset -2px -3px 0 rgba(0,0,0,.28);
@@ -288,12 +322,12 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
 }
 .dmg-ss b{
   font-family:var(--font-pixel);font-weight:400;font-size:5.5px;
-  letter-spacing:.14em;color:#8b867c;
+  letter-spacing:.14em;color:#7b71a8;
 }
 .dmg-speaker{
   position:absolute;right:20px;bottom:24px;width:56px;height:50px;
   transform:rotate(-24deg);
-  background:repeating-linear-gradient(90deg,var(--shell-dark) 0 5px,transparent 5px 12px);
+  background:repeating-linear-gradient(90deg,#241d45 0 5px,transparent 5px 12px);
 }
 
 /* ============================================================
@@ -307,7 +341,7 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
   max-width:560px;margin:0 auto;
   background:var(--surface);
   border:2px solid var(--border-strong);
-  box-shadow:var(--shadow-hard);
+  box-shadow:var(--shadow-hard),0 0 26px rgba(0,240,255,.1),0 0 64px rgba(178,107,255,.12);
 }
 .screen-stage{position:relative;aspect-ratio:10/9;background:var(--bg-deep);overflow:hidden;}
 .screen-stage iframe{
@@ -321,20 +355,21 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
 .play-cover p{margin:0;color:var(--muted);font-size:14.5px;}
 .play-cover .cover-title{
   font-family:var(--font-pixel);font-size:12px;letter-spacing:.16em;
-  color:var(--screen-2);margin:0 0 2px;
+  color:var(--accent);margin:0 0 2px;text-shadow:0 0 12px rgba(0,240,255,.5);
 }
 .play-loading .load-title{
   font-family:var(--font-pixel);font-size:12px;letter-spacing:.16em;
-  color:var(--screen-2);margin:0;
+  color:var(--accent);margin:0;
 }
 .load-blocks{display:flex;gap:6px;}
 .load-blocks i{
-  width:13px;height:13px;background:var(--screen-2);
+  width:13px;height:13px;background:var(--accent);
   animation:blockpulse .9s ease-in-out infinite;
 }
 .load-blocks i:nth-child(2){animation-delay:.15s;}
 .load-blocks i:nth-child(3){animation-delay:.3s;}
 .load-blocks i:nth-child(4){animation-delay:.45s;}
+.load-blocks i:nth-child(even){background:var(--neon-mag);}
 @keyframes blockpulse{0%,70%{opacity:.15;}80%,100%{opacity:1;}}
 .load-slow{font-size:12.5px;color:var(--muted);margin:0;max-width:34ch;}
 .play-error .err-title{
@@ -342,7 +377,7 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
   color:var(--danger);margin:0;
 }
 .play-error p{margin:0;color:var(--muted);font-size:14px;max-width:38ch;}
-.play-error code{font-size:10px;color:var(--screen-2);}
+.play-error code{font-size:10px;color:var(--accent);}
 .play-note{max-width:560px;margin:14px auto 0;font-size:13px;color:var(--muted);text-align:center;}
 .noscript-note{color:var(--danger);text-align:center;font-size:14px;margin:14px 0 0;}
 
@@ -354,11 +389,15 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
   background:var(--surface);border:1px solid var(--border);
   box-shadow:var(--shadow-hard);padding:22px 22px 20px;
   display:flex;flex-direction:column;min-width:0;
+  transition:border-color .2s ease-out,box-shadow .2s ease-out,transform .2s ease-out;
 }
+.tech-card:hover{border-color:rgba(0,240,255,.45);box-shadow:var(--shadow-hard),0 0 22px rgba(0,240,255,.1);transform:translateY(-2px);}
 .tech-card .tag{
   align-self:flex-start;
   font-family:var(--font-pixel);font-size:8.5px;letter-spacing:.16em;
-  background:var(--screen-0);color:var(--screen-3);
+  background:linear-gradient(90deg,rgba(0,240,255,.16),rgba(255,46,166,.16));
+  color:var(--accent);
+  border:1px solid rgba(0,240,255,.42);
   padding:6px 8px;margin:0 0 14px;
 }
 .tech-card h3{font-size:19px;margin:0 0 10px;line-height:1.4;}
@@ -375,10 +414,10 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
   min-height:110px;padding:16px;text-align:center;
   color:var(--muted);font-size:12.5px;
 }
-.slot-hint code{font-size:9px;color:var(--screen-2);}
+.slot-hint code{font-size:9px;color:var(--accent);}
 /* 寄存器速览块（中断 / 定时器卡片） */
 .reg{
-  border:2px solid var(--border-strong);background:var(--bg-deep);
+  border:2px solid rgba(139,172,15,.42);background:#0a0f0b;
   font-family:var(--font-pixel);font-size:10px;line-height:2.15;letter-spacing:.06em;
   color:var(--screen-2);padding:14px 16px;overflow-x:auto;white-space:nowrap;
 }
@@ -392,12 +431,12 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
 .tl-item:last-child{padding-bottom:0;}
 .tl-node{
   position:absolute;left:-9px;top:4px;width:14px;height:14px;
-  background:var(--bg);border:2px solid var(--screen-2);
+  background:var(--bg);border:2px solid var(--accent);
 }
-.tl-item.lit .tl-node{background:var(--screen-2);box-shadow:0 0 10px rgba(139,172,15,.5);}
+.tl-item.lit .tl-node{background:var(--neon-mag);border-color:var(--neon-mag);box-shadow:0 0 12px rgba(255,46,166,.55);}
 .tl-tag{
   display:block;font-family:var(--font-pixel);font-size:9px;
-  letter-spacing:.18em;color:var(--screen-2);margin:0 0 8px;
+  letter-spacing:.18em;color:var(--accent);margin:0 0 8px;
 }
 .tl-item h3{font-size:18px;margin:0 0 8px;}
 .tl-item p{margin:0;color:var(--muted);font-size:14.5px;max-width:56ch;}
@@ -405,12 +444,13 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
 /* ============================================================
    10. 页脚
    ============================================================ */
-.site-footer{border-top:1px solid var(--border);padding:44px 0 40px;background:var(--bg-deep);}
+.site-footer{padding:44px 0 40px;background:var(--bg-deep);
+  background-image:var(--hairline-neon);background-repeat:no-repeat;background-position:top;background-size:100% 1px;}
 .legal{font-size:13.5px;line-height:1.9;margin:0 0 18px;max-width:72ch;}
 .legal b{color:var(--fg);}
 .colophon{font-size:13px;color:var(--muted);margin:0 0 8px;}
-.colophon a{color:var(--screen-2);text-decoration:underline;text-underline-offset:3px;}
-.colophon a:hover{color:var(--fg);}
+.colophon a{color:var(--accent);text-decoration:underline;text-underline-offset:3px;}
+.colophon a:hover{color:#fff;}
 .font-credit{font-size:12px;color:var(--muted);opacity:.75;margin:0;}
 
 /* ============================================================
@@ -449,7 +489,7 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
   .btn,.btn-mini{transition:none;}
 }
 @media print{
-  body::before{display:none;}
+  body::before,body::after{display:none;}
   .site-header,.hero-cta{display:none;}
   body{background:#fff;color:#111;}
 }
