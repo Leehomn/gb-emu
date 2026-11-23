@@ -41,7 +41,16 @@ header{
 .stat{border:1px solid var(--line);background:#0f1f0fcc;border-radius:8px;padding:4px 12px;text-align:center;min-width:70px}
 .stat .k{font-size:9px;color:var(--text-faint);letter-spacing:1px}
 .stat .v{font-size:16px;font-weight:bold;color:var(--mint)}
-main{flex:1 1 auto;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:16px}
+main{
+  flex:1 1 auto;display:grid;gap:14px;padding:16px;
+  grid-template-columns:1fr 1fr;grid-template-rows:auto auto auto;
+  grid-template-areas:"crt crt" "dpad touchpad" "toolbar toolbar";
+  align-items:center;justify-items:center;
+}
+.crt{grid-area:crt}
+.dpad{grid-area:dpad}
+.touchpad{grid-area:touchpad}
+.toolbar{grid-area:toolbar}
 .crt{
   position:relative;border:2px solid var(--line2);border-radius:12px;overflow:hidden;
   background:#0f380f;
@@ -69,11 +78,7 @@ main{flex:1 1 auto;display:flex;flex-direction:column;align-items:center;justify
 }
 .exitbtn:hover{background:#4a2024;box-shadow:0 0 16px #ff4d5e44}
 .hidden{display:none!important}
-.controls{
-  display:flex;justify-content:space-between;align-items:center;gap:8px;
-  width:100%;max-width:640px;padding:0 4px;flex:0 0 auto;
-}
-.touchpad{display:flex;gap:8px;align-items:center}
+.touchpad{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:center}
 .tbtn{
   width:56px;height:56px;font-family:inherit;font-size:20px;border-radius:50%;
   color:var(--green);background:#1a3a1acc;border:2px solid var(--line2);cursor:pointer;
@@ -107,10 +112,30 @@ footer{flex:0 0 auto;padding:8px 18px;border-top:1px solid var(--line);font-size
   .stat .v{font-size:14px}
 }
 @media (max-width:380px){
-  .controls{flex-wrap:wrap;justify-content:center;gap:6px}
   .dpad{grid-template-columns:repeat(3,38px);grid-template-rows:repeat(3,38px);gap:3px}
   .dpad button{width:38px;height:38px;font-size:14px}
   .tbtn{width:48px;height:48px;font-size:18px}
+}
+/* ===== 横屏（手机横过来）：真掌机三栏布局 ===== */
+@media (orientation:landscape) and (max-height:500px){
+  body{overflow:hidden}
+  header{padding:4px 10px}
+  header .logo h1{font-size:12px}
+  header .stats{display:none}
+  main{
+    grid-template-columns:auto minmax(0,1fr) auto;
+    grid-template-rows:auto auto;
+    grid-template-areas:"dpad crt touchpad" "dpad toolbar touchpad";
+    gap:8px;padding:6px;
+  }
+  .crt{max-height:88vh;width:auto}
+  #screen{max-height:88vh;width:auto}
+  /* 触屏键放大：方向键 44→58、AB 56→68，符合拇指按压力学 */
+  .dpad{grid-template-columns:repeat(3,58px);grid-template-rows:repeat(3,58px);gap:5px}
+  .dpad button{width:58px;height:58px;font-size:20px}
+  .tbtn{width:68px;height:68px;font-size:24px}
+  .toolbar{max-width:none;justify-content:center}
+  footer{display:none}
 }
 </style>
 </head>
@@ -143,19 +168,17 @@ footer{flex:0 0 auto;padding:8px 18px;border-top:1px solid var(--line);font-size
     </div>
     <div class="pauseoverlay hidden" id="pauseoverlay">⏸ 已暂停 · 按 P 继续</div>
   </div>
-  <div class="controls" id="controls">
-    <div class="dpad" id="dpad">
-      <button class="up" data-key="up">▲</button>
-      <button class="down" data-key="down">▼</button>
-      <button class="left" data-key="left">◀</button>
-      <button class="right" data-key="right">▶</button>
-      <button class="center"></button>
-    </div>
-    <div class="touchpad" id="touchpad">
-      <button class="tbtn" data-key="a">A</button>
-      <button class="tbtn" data-key="b">B</button>
-      <button class="tbtn" data-key="start">S</button>
-    </div>
+  <div class="dpad" id="dpad">
+    <button class="up" data-key="up">▲</button>
+    <button class="down" data-key="down">▼</button>
+    <button class="left" data-key="left">◀</button>
+    <button class="right" data-key="right">▶</button>
+    <button class="center"></button>
+  </div>
+  <div class="touchpad" id="touchpad">
+    <button class="tbtn" data-key="a">A</button>
+    <button class="tbtn" data-key="b">B</button>
+    <button class="tbtn" data-key="start">S</button>
   </div>
   <div class="toolbar" id="toolbar">
     <button class="toolbtn" id="btnPause">⏸ 暂停</button>
@@ -163,6 +186,7 @@ footer{flex:0 0 auto;padding:8px 18px;border-top:1px solid var(--line);font-size
     <button class="toolbtn" id="btnPalette">🎨 滤镜</button>
     <button class="toolbtn" id="btnMute">🔊 有声</button>
     <input type="range" id="volSlider" min="0" max="100" value="100" title="音量">
+    <button class="toolbtn" id="btnFull">⛶ 全屏</button>
   </div>
 </main>
 
@@ -370,6 +394,19 @@ function toggleMute(){
   if(gainNode) gainNode.gain.value=muted?0:volume;
   $("btnMute").textContent=muted?"🔇 静音":"🔊 有声";
 }
+// 全屏：进入全屏 + 尝试锁横屏（Android Chrome 有效，iOS 无效但不会报错）
+async function toggleFullscreen(){
+  if(!document.fullscreenElement){
+    try{
+      await document.documentElement.requestFullscreen();
+      if(screen.orientation && screen.orientation.lock){
+        try{ await screen.orientation.lock("landscape"); }catch(e){}
+      }
+    }catch(e){}
+  }else{
+    document.exitFullscreen();
+  }
+}
 
 $("btnLoad").addEventListener("click",()=>$("fileInput").click());
 $("btnExit").addEventListener("click",exitGame);
@@ -377,6 +414,7 @@ $("btnPause").addEventListener("click",togglePause);
 $("btnFF").addEventListener("click",toggleTurbo);
 $("btnPalette").addEventListener("click",cyclePalette);
 $("btnMute").addEventListener("click",toggleMute);
+$("btnFull").addEventListener("click",toggleFullscreen);
 $("volSlider").addEventListener("input",e=>setVolume(e.target.value/100));
 $("fileInput").addEventListener("change",e=>{
   const f=e.target.files[0]; if(!f) return;
