@@ -85,6 +85,20 @@ main{flex:1 1 auto;display:flex;flex-direction:column;align-items:center;justify
 .dpad .up{grid-column:2;grid-row:1} .dpad .down{grid-column:2;grid-row:3}
 .dpad .left{grid-column:1;grid-row:2} .dpad .right{grid-column:3;grid-row:2}
 .dpad .center{grid-column:2;grid-row:2;background:#0f1f0f;border-color:var(--line)}
+.toolbar{display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:8px;width:100%;max-width:640px;padding:0 4px;flex:0 0 auto}
+.toolbtn{
+  padding:8px 14px;font-family:inherit;font-size:13px;letter-spacing:1px;cursor:pointer;
+  color:var(--green);background:#1a3a1acc;border:2px solid var(--line2);border-radius:8px;
+  user-select:none;touch-action:none;white-space:nowrap;
+}
+.toolbtn:hover{background:#2a5a2a;color:#fff}
+.toolbtn:active{background:#2a5a2a;color:#fff}
+.toolbtn.on{background:#2a5a2a;color:#fff;border-color:var(--green)}
+#volSlider{width:90px;accent-color:var(--green);cursor:pointer}
+.pauseoverlay{
+  position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  background:#00000088;z-index:4;font-size:20px;color:var(--amber);letter-spacing:3px;pointer-events:none;
+}
 footer{flex:0 0 auto;padding:8px 18px;border-top:1px solid var(--line);font-size:10px;color:var(--text-faint);text-align:center}
 @media (max-width:600px){
   .crt{max-width:95vw}
@@ -125,8 +139,9 @@ footer{flex:0 0 auto;padding:8px 18px;border-top:1px solid var(--line);font-size
       <button class="filebtn" data-game="minesweep">▶ 玩扫雷</button>
       <button class="filebtn" id="btnLoad" style="border-color:var(--line2);color:var(--text-dim);font-size:13px">📁 加载 ROM</button>
       <input type="file" id="fileInput" accept=".gb,.gbc">
-      <p class="press">点击开始后，方向键移动 · X=A · Z=B · Enter=Start</p>
+      <p class="press">方向键移动 · X=A · Z=B · Enter=Start · P 暂停 · F 快进</p>
     </div>
+    <div class="pauseoverlay hidden" id="pauseoverlay">⏸ 已暂停 · 按 P 继续</div>
   </div>
   <div class="controls" id="controls">
     <div class="dpad" id="dpad">
@@ -142,6 +157,13 @@ footer{flex:0 0 auto;padding:8px 18px;border-top:1px solid var(--line);font-size
       <button class="tbtn" data-key="start">S</button>
     </div>
   </div>
+  <div class="toolbar" id="toolbar">
+    <button class="toolbtn" id="btnPause">⏸ 暂停</button>
+    <button class="toolbtn" id="btnFF">⏩ 快进</button>
+    <button class="toolbtn" id="btnPalette">🎨 滤镜</button>
+    <button class="toolbtn" id="btnMute">🔊 有声</button>
+    <input type="range" id="volSlider" min="0" max="100" value="100" title="音量">
+  </div>
 </main>
 
 <footer>
@@ -155,7 +177,15 @@ footer{flex:0 0 auto;padding:8px 18px;border-top:1px solid var(--line);font-size
 // 这里只保留：canvas 渲染、Web Audio 播放、键盘/触屏、localStorage 存档、三款游戏切换。
 const cvs=document.getElementById("screen"), ctx=cvs.getContext("2d");
 const SCALE=4, W=160*SCALE, H=144*SCALE;
-const PALETTE=[0xE0F8D0,0x88C070,0x346856,0x081820];
+// 4 套配色（经典绿 / 复古黄绿 / 黑白 / 蓝背光），存的是 4 档色号对应的 RGB
+const PALETTES=[
+  [0xE0F8D0,0x88C070,0x346856,0x081820],  // 经典绿
+  [0x9BBC0F,0x8BAC0F,0x306230,0x0F380F],  // 复古黄绿
+  [0xFFFFFF,0xAAAAAA,0x555555,0x000000],  // 黑白
+  [0xE0F8F0,0x88C0D0,0x346878,0x081820],  // 蓝背光
+];
+let curPalette=0;
+function palette(){ return PALETTES[curPalette]; }
 const imgData=ctx.createImageData(W,H);
 
 let wasm=null, mem=null, gb=null;
@@ -165,7 +195,8 @@ let gameState="menu";
 // 当前按键状态（0=按下）。位序和 Rust joypad 一致：dir bit0-3=右左上下，btn bit0-3=A B Select Start
 let curDir=0x0F, curBtn=0x0F;
 let sramKey=null, saveTimer=null;
-let audioCtx=null, audioBuf=null, audioPos=0;
+let audioCtx=null, audioBuf=null, audioPos=0, gainNode=null;
+let paused=false, turbo=false, muted=false, volume=1.0;
 let lastT=0, fpsN=0, fpsAcc=0;
 
 const $=id=>document.getElementById(id);
@@ -184,8 +215,9 @@ const wasmReady = (async()=>{
 function render(){
   const ptr=wasm.gb_screen_ptr(gb);
   const fb=new Uint8Array(mem.buffer, ptr, 160*144);
+  const pal=palette();
   for(let y=0;y<144;y++)for(let x=0;x<160;x++){
-    const c=hexToRgb(PALETTE[fb[y*160+x]]);
+    const c=hexToRgb(pal[fb[y*160+x]]);
     for(let sy=0;sy<SCALE;sy++)for(let sx=0;sx<SCALE;sx++){
       const idx=((y*SCALE+sy)*W+x*SCALE+sx)*4;
       imgData.data[idx]=c[0]; imgData.data[idx+1]=c[1]; imgData.data[idx+2]=c[2]; imgData.data[idx+3]=255;
@@ -212,19 +244,25 @@ function initAudio(){
   const buf=ctx.createBuffer(1,44100,44100);   // 1 秒环形缓冲
   audioBuf=buf.getChannelData(0); audioPos=0;
   const src=ctx.createBufferSource();
-  src.buffer=buf; src.loop=true; src.connect(ctx.destination); src.start();
+  src.buffer=buf; src.loop=true;
+  gainNode=ctx.createGain();                   // 音量控制节点
+  gainNode.gain.value=volume;
+  src.connect(gainNode); gainNode.connect(ctx.destination);
+  src.start();
   audioCtx=ctx;
   if(ctx.state==="suspended") ctx.resume();
 }
 
-// 主循环：每帧跑一次 gb_run_frame，同步按键、渲染、喂音频
+// 主循环：每帧跑一次 gb_run_frame（快进时连跑 3 帧），同步按键、渲染、喂音频
 function loop(t){
   if(gameState!=="playing") return;
   const dt=t-lastT; lastT=t;
   fpsAcc+=dt; fpsN++;
   if(fpsAcc>500){ $("fpsV").textContent=Math.round(1000/(fpsAcc/fpsN)); fpsAcc=0; fpsN=0; }
   wasm.gb_set_keys(gb, curDir, curBtn);
-  wasm.gb_run_frame(gb);
+  if(paused){ render(); requestAnimationFrame(loop); return; }   // 暂停：不推进内核，只保持画面
+  const frames=turbo?3:1;
+  for(let i=0;i<frames;i++) wasm.gb_run_frame(gb);
   render();
   pushAudio();
   requestAnimationFrame(loop);
@@ -294,13 +332,52 @@ function exitGame(){
   gameState="menu";
   if(gb){ wasm.gb_free(gb); gb=null; }   // 决策①：直接释放，退出=彻底结束一局
   curDir=0x0F; curBtn=0x0F;
+  paused=false; turbo=false;             // 重置体验开关，免得带进下一局
+  $("pauseoverlay").classList.add("hidden");
+  $("btnPause").classList.remove("on"); $("btnPause").textContent="⏸ 暂停";
+  $("btnFF").classList.remove("on");
   $("statusV").textContent="待机";
   $("overlay").classList.remove("hidden");
   $("btnExit").classList.add("hidden");
 }
 
+// 暂停 / 快进 / 滤镜 / 音量 四个体验开关
+function togglePause(){
+  paused=!paused;
+  $("pauseoverlay").classList.toggle("hidden",!paused);
+  $("btnPause").classList.toggle("on",paused);
+  $("btnPause").textContent=paused?"▶ 继续":"⏸ 暂停";
+}
+function toggleTurbo(){
+  turbo=!turbo;
+  $("btnFF").classList.toggle("on",turbo);
+}
+function cyclePalette(){
+  curPalette=(curPalette+1)%PALETTES.length;
+  const names=["经典绿","复古黄绿","黑白","蓝背光"];
+  $("btnPalette").textContent="🎨 "+names[curPalette];
+  render();
+}
+function setVolume(v){
+  volume=v;
+  if(gainNode) gainNode.gain.value=v;
+  muted=false;
+  $("btnMute").textContent="🔊 有声";
+  $("volSlider").value=Math.round(v*100);
+}
+function toggleMute(){
+  muted=!muted;
+  if(gainNode) gainNode.gain.value=muted?0:volume;
+  $("btnMute").textContent=muted?"🔇 静音":"🔊 有声";
+}
+
 $("btnLoad").addEventListener("click",()=>$("fileInput").click());
 $("btnExit").addEventListener("click",exitGame);
+$("btnPause").addEventListener("click",togglePause);
+$("btnFF").addEventListener("click",toggleTurbo);
+$("btnPalette").addEventListener("click",cyclePalette);
+$("btnMute").addEventListener("click",toggleMute);
+$("volSlider").addEventListener("input",e=>setVolume(e.target.value/100));
 $("fileInput").addEventListener("change",e=>{
   const f=e.target.files[0]; if(!f) return;
   const r=new FileReader();
@@ -310,6 +387,8 @@ $("fileInput").addEventListener("change",e=>{
 document.addEventListener("keydown",e=>{
   if(e.key==="Escape"){ exitGame(); return; }
   if(gameState!=="playing") return;
+  if(e.key==="p"||e.key==="P"){ togglePause(); return; }
+  if(e.key==="f"||e.key==="F"){ toggleTurbo(); return; }
   const k=keyMap[e.key]||keyMap[e.key.toLowerCase()];
   if(!k) return;
   e.preventDefault();
