@@ -16,9 +16,9 @@
 | 定时器 | DIV + TIMA/TMA/TAC，按 TAC 分频累加、溢出回装 |
 | 串口 | 0xFF01/0xFF02，把测试 ROM 的 `ok` 结果吐到终端 |
 | PPU | 背景层（BG）+ Window + 精灵层（OBJ），含 SCX/SCY 滚动、图块映射、调色板、DMA、STAT 中断 |
-| MBC | MBC1 换页 + SRAM 存档（.sav 落盘 / 网页 localStorage） |
+| MBC | MBC1/MBC3/MBC5 换页 + SRAM 存档 + RTC 寄存器（.sav 落盘 / 网页 localStorage） |
 | APU | 4 通道（方波×2 + 波形 + 噪声）+ 帧序列器，WAV 输出 / 网页 Web Audio |
-| 验证 | Blargg CPU 指令考卷 **75/75 全过** + Mooneye MBC1 **13 卷全过** |
+| 验证 | Blargg CPU 指令考卷 **75/75 全过** + Mooneye MBC1 **13 卷** + MBC5 **8 卷全过** |
 
 ## 怎么跑
 
@@ -82,6 +82,8 @@ gb-emu/
   - **Adjustris**（tbsp/Adjustris）—— CC0-1.0
   - **2048**（Sanqui/2048-gb）—— Zlib License
   - **扫雷**（lancekindle/minesweepGB）—— GPL-3.0
+  - **Tobu Tobu Girl**（tangramgames）—— MIT（代码）+ CC BY 4.0（素材），MBC1 换页
+  - **Gigant Golf**（quinnyo/gbcompo2023）—— GPLv3（代码）+ CC BY-SA（素材），纯 32KB ROM
 - 商业游戏 ROM 受版权保护，**本仓库不包含、不传播**。请自备合法取得的 ROM 文件，用「📁 加载 ROM」自行载入。
 
 ## 学习路线
@@ -93,6 +95,7 @@ CHIP-8（35 条指令，Python）
   → Blargg 考卷 75/75
   → PPU 显像（BG + Window + OBJ + STAT 中断）
   → MBC1 换页 + SRAM 存档（Mooneye 13 卷全过）
+  → MBC3/MBC5 换页 + RTC 寄存器（Mooneye MBC5 8 卷全过）
   → APU 音频（4 通道 + 帧序列器）
   → 网页版跑开源游戏（Adjustris / 2048 / 扫雷），能玩有声
 ```
@@ -105,3 +108,4 @@ CHIP-8（35 条指令，Python）
 - [x] ④ 显像：BG + Window + OBJ + STAT 中断，开源游戏可玩
 - [x] ⑤ 音频（APU 4 通道 + 帧序列器）
 - [x] ⑥ MBC1 换页 + SRAM 存档（Mooneye 13 卷全过）
+- [x] ⑦ MBC3/MBC5 换页 + RTC 寄存器（Mooneye MBC5 8 卷全过）
