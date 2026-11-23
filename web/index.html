@@ -62,6 +62,12 @@ main{flex:1 1 auto;display:flex;flex-direction:column;align-items:center;justify
   transition:all .2s;
 }
 .filebtn:hover{background:#2a5a2a;box-shadow:0 0 20px #9bce4e44}
+.exitbtn{
+  padding:6px 14px;font-family:inherit;font-size:13px;letter-spacing:1px;cursor:pointer;
+  border:2px solid var(--red);border-radius:8px;background:#2a1416;color:var(--red);
+  transition:all .2s;margin-left:6px;white-space:nowrap;
+}
+.exitbtn:hover{background:#4a2024;box-shadow:0 0 16px #ff4d5e44}
 .hidden{display:none!important}
 .controls{
   display:flex;justify-content:space-between;align-items:center;gap:8px;
@@ -104,6 +110,7 @@ footer{flex:0 0 auto;padding:8px 18px;border-top:1px solid var(--line);font-size
     <div class="stat"><div class="k">状态</div><div class="v" id="statusV">待机</div></div>
     <div class="stat"><div class="k">帧率</div><div class="v" id="fpsV">0</div></div>
   </div>
+  <button class="exitbtn hidden" id="btnExit">⏻ 退出</button>
 </header>
 
 <main>
@@ -151,7 +158,10 @@ const SCALE=4, W=160*SCALE, H=144*SCALE;
 const PALETTE=[0xE0F8D0,0x88C070,0x346856,0x081820];
 const imgData=ctx.createImageData(W,H);
 
-let wasm=null, mem=null, gb=null, running=false;
+let wasm=null, mem=null, gb=null;
+// 显式状态机：'menu' = 菜单态（overlay 显示，可点游戏）；'playing' = 运行态。
+// 所有东西（循环/按键/音频/存档）都听 gameState 指挥，不再靠零散的布尔值。
+let gameState="menu";
 // 当前按键状态（0=按下）。位序和 Rust joypad 一致：dir bit0-3=右左上下，btn bit0-3=A B Select Start
 let curDir=0x0F, curBtn=0x0F;
 let sramKey=null, saveTimer=null;
@@ -209,7 +219,7 @@ function initAudio(){
 
 // 主循环：每帧跑一次 gb_run_frame，同步按键、渲染、喂音频
 function loop(t){
-  if(!running) return;
+  if(gameState!=="playing") return;
   const dt=t-lastT; lastT=t;
   fpsAcc+=dt; fpsN++;
   if(fpsAcc>500){ $("fpsV").textContent=Math.round(1000/(fpsAcc/fpsN)); fpsAcc=0; fpsN=0; }
@@ -267,20 +277,49 @@ function startGame(rom){
   if(saveTimer) clearInterval(saveTimer);
   if(wasm.gb_sram_len(gb)>0) saveTimer=setInterval(saveSram, 2000);
 
-  running=true;
+  gameState="playing";
   $("statusV").textContent="运行中";
   $("overlay").classList.add("hidden");
+  $("btnExit").classList.remove("hidden");
   lastT=performance.now();
   initAudio();
   requestAnimationFrame(loop);
 }
 
+// 退出：强制存一次档 → 停循环 → 释放实例 → 回菜单态
+function exitGame(){
+  if(gameState!=="playing") return;
+  saveSram();                       // 决策②：退出瞬间强制收尾存档，不赌 2 秒定时器
+  if(saveTimer){ clearInterval(saveTimer); saveTimer=null; }
+  gameState="menu";
+  if(gb){ wasm.gb_free(gb); gb=null; }   // 决策①：直接释放，退出=彻底结束一局
+  curDir=0x0F; curBtn=0x0F;
+  $("statusV").textContent="待机";
+  $("overlay").classList.remove("hidden");
+  $("btnExit").classList.add("hidden");
+}
+
 $("btnLoad").addEventListener("click",()=>$("fileInput").click());
+$("btnExit").addEventListener("click",exitGame);
 $("fileInput").addEventListener("change",e=>{
   const f=e.target.files[0]; if(!f) return;
   const r=new FileReader();
   r.onload=async()=>{ await wasmReady; startGame(new Uint8Array(r.result)); };
   r.readAsArrayBuffer(f);
+});
+document.addEventListener("keydown",e=>{
+  if(e.key==="Escape"){ exitGame(); return; }
+  if(gameState!=="playing") return;
+  const k=keyMap[e.key]||keyMap[e.key.toLowerCase()];
+  if(!k) return;
+  e.preventDefault();
+  pressKey(k);
+});
+document.addEventListener("keyup",e=>{
+  if(gameState!=="playing") return;
+  const k=keyMap[e.key]||keyMap[e.key.toLowerCase()];
+  if(!k) return;
+  releaseKey(k);
 });
 /* 内置 3 款开源游戏（许可见 README：Adjustris CC0 / 2048 Zlib / 扫雷 GPL-3.0） */
 const ROMS_B64 = {
@@ -312,25 +351,12 @@ function releaseKey(k){
   else if(k==="select") curBtn|=0x04;
   else if(k==="start") curBtn|=0x08;
 }
-document.addEventListener("keydown",e=>{
-  if(!running) return;
-  const k=keyMap[e.key]||keyMap[e.key.toLowerCase()];
-  if(!k) return;
-  e.preventDefault();
-  pressKey(k);
-});
-document.addEventListener("keyup",e=>{
-  if(!running) return;
-  const k=keyMap[e.key]||keyMap[e.key.toLowerCase()];
-  if(!k) return;
-  releaseKey(k);
-});
 
 /* 触屏 */
 for(const btn of document.querySelectorAll("[data-key]")){
   const k=btn.dataset.key;
-  const on=e=>{ e.preventDefault(); if(!running)return; pressKey(k); };
-  const off=e=>{ e.preventDefault(); if(!running)return; releaseKey(k); };
+  const on=e=>{ e.preventDefault(); if(gameState!=="playing")return; pressKey(k); };
+  const off=e=>{ e.preventDefault(); if(gameState!=="playing")return; releaseKey(k); };
   btn.addEventListener("pointerdown",on);
   btn.addEventListener("pointerup",off);
   btn.addEventListener("pointerleave",off);
