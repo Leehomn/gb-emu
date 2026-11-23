@@ -127,12 +127,12 @@ impl Bus {
                 // Joypad 读：bit4/5 是选择线（0=选中），返回低4位按键状态（0=按下）
                 let sel = self.mem[0xFF00];
                 let mut result = 0x0F;   // 默认全没按
-                if sel & 0x20 == 0 {
-                    // 选中方向键（P15）：右左上下 → bit0~3
+                if sel & 0x10 == 0 {
+                    // P14(bit4)=0 选中方向键：右左上下 → bit0~3
                     result &= self.joypad_dir;
                 }
-                if sel & 0x10 == 0 {
-                    // 选中功能键（P14）：Select Start B A → bit3~0（注意顺序）
+                if sel & 0x20 == 0 {
+                    // P15(bit5)=0 选中功能键：A B Select Start → bit0~3
                     result &= self.joypad_btn;
                 }
                 let r = (sel & 0x30) | result | 0xC0;   // 高2位恒1
