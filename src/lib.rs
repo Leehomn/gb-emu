@@ -78,8 +78,11 @@ pub struct Bus {
     pub multicart: bool,      // 是否 multicart（特殊接线）
     pub rom_bank: u16,        // MBC3/MBC5 当前 ROM bank（MBC3:1-127, MBC5:0-511）
     pub ram_bank: u8,         // MBC3/MBC5 当前 RAM bank（MBC3:0-3 或 8-12=RTC 寄存器, MBC5:0-15）
-    pub rtc: [u8; 5],         // MBC3 RTC 寄存器（秒/分/时/日低8位/日高1位+停止+进位）
-    pub rtc_latch_pre: bool,  // MBC3 RTC 锁存：上一次写 0x6000 区是否为 0
+    pub rtc_sec: u64,            // MBC3 RTC 累计秒数（二进制，走时核心；宿主注入墙钟推进）
+    pub rtc_halted: bool,        // RTC 停止标志（寄存器 0x0C 的 bit6，置 1 停止走时）
+    pub rtc_latched: [u8; 5],    // 锁存快照（写 0x6000 区 0→1 时从 rtc_sec 换算并冻结）
+    pub rtc_latch_pre: bool,     // RTC 锁存序列：上一次写 0x6000 区是否为 0
+    pub rtc_last_wall: Option<u64>, // 上次宿主注入的墙钟秒数（首帧只设基准、不算增量）
     pub serial_out: String,   // 考卷成绩单收集处
     pub div_acc: u32,         // DIV 分频累加器（每周期+1，满256归零并让DIV+1）
     pub tac: u8,              // 定时器控制（低3位有效）
@@ -108,13 +111,37 @@ fn is_mbc1_multicart(cart: &[u8]) -> bool {
     }
     count >= 3
 }
+
+// MBC3 RTC：把累计秒数换算成 5 字节寄存器（BCD 秒/分/时/日低 8 位 + 日高 1 位）。
+// 寄存器 0..=3 存 BCD（每字节两位十进制），寄存器 4 的 bit0=日的第 9 位。
+// bit7(日高)=进位标志（日计数溢出 511→0 时置位）、bit6(日高)=停止标志，由 halted 参数回填。
+fn rtc_pack(secs: u64, halted: bool) -> [u8; 5] {
+    let days_total = secs / 86_400;              // 完整天数（未截断）
+    let days = days_total & 0x1FF;               // 日计数：9 位，最大 511 天后回绕
+    let tod = secs % 86_400;                     // 当天剩余秒数
+    let sec = (tod % 60) as u8;
+    let min = ((tod / 60) % 60) as u8;
+    let hour = ((tod / 3600) % 24) as u8;
+    let mut out = [0u8; 5];
+    out[0] = (sec / 10) << 4 | (sec % 10);        // 秒 BCD
+    out[1] = (min / 10) << 4 | (min % 10);        // 分 BCD
+    out[2] = (hour / 10) << 4 | (hour % 10);      // 时 BCD（真机可 0-23）
+    let day_lo = (days & 0xFF) as u8;
+    out[3] = (day_lo / 100) << 4 | ((day_lo / 10) % 10); // 日低 8 位 BCD（硬件只存百位+十位，个位进日高）
+    out[4] = ((days >> 8) & 1) as u8;             // 日高 bit0
+    if days_total >= 512 { out[4] |= 0x80; }      // bit7 进位标志：日计数溢出过
+    if halted { out[4] |= 0x40; }                 // bit6 停止标志
+    out
+}
 impl Bus {
     pub fn new() -> Self {
         let mut b = Bus {
             mem: vec![0; 0x10000],
             cart: Vec::new(), ram: Vec::new(), mbc_type: 0,
             ramg: false, bank1: 1, bank2: 0, mode: false, multicart: false,
-            rom_bank: 1, ram_bank: 0, rtc: [0; 5], rtc_latch_pre: false,
+            rom_bank: 1, ram_bank: 0,
+            rtc_sec: 0, rtc_halted: false, rtc_latched: [0; 5],
+            rtc_latch_pre: false, rtc_last_wall: None,
             serial_out: String::new(), div_acc: 0, tac: 0, tima_acc: 0,
             joypad_dir: 0x0F, joypad_btn: 0x0F, joy_reads: 0, joy_log: Vec::new(),
             apu_writes: Vec::new(),
@@ -182,7 +209,7 @@ impl Bus {
     fn read_ram(&self, addr: u16) -> u8 {
         if !self.ramg { return 0xFF; }   // 没开锁读到的就是垃圾
         if self.is_mbc3() && (0x08..=0x0C).contains(&self.ram_bank) {
-            return self.rtc[(self.ram_bank - 0x08) as usize];   // MBC3 把 0xA000 窗口映射到 RTC 寄存器
+            return self.rtc_latched[(self.ram_bank - 0x08) as usize];   // 读的是锁存快照，不是实时计数器
         }
         if self.ram.is_empty() { return 0xFF; }
         self.ram[self.ram_addr(addr)]
@@ -190,7 +217,14 @@ impl Bus {
     fn write_ram(&mut self, addr: u16, val: u8) {
         if !self.ramg { return; }
         if self.is_mbc3() && (0x08..=0x0C).contains(&self.ram_bank) {
-            self.rtc[(self.ram_bank - 0x08) as usize] = val;   // MBC3 写 RTC 寄存器
+            // 写 RTC 寄存器：真机只有日高寄存器(0x0C)可写，且 bit7 是进位标志（只读，写 0）
+            // bit6 = 停止标志：写 1 停止走时、写 0 恢复并重置分频。其余寄存器写被忽略。
+            if self.ram_bank == 0x0C {
+                self.rtc_halted = val & 0x40 != 0;   // 停止标志
+                // 注意：真机上「写 0 恢复」会把分频器清零，这里按秒级精度简化，不做分频
+            }
+            // 锁存快照同步更新到「当前」值：真机写 RTC 寄存器会让后续锁存读取到被修改的日高
+            // 这里简化处理——写只影响停止标志，计数保持连续；锁存值由 tick 推进时实时换算。
             return;
         }
         if !self.ram.is_empty() {
@@ -235,8 +269,8 @@ impl Bus {
                 if is_mbc1 {
                     self.mode = val & 1 != 0;                                            // 模式位
                 } else if is_mbc3 {
-                    // RTC 锁存：先写 0x00 再写 0x01 才把当前时间快照进寄存器（暂不实现真 RTC 走时）
-                    if self.rtc_latch_pre && val == 0x01 { /* 快照占位 */ }
+                    // RTC 锁存：写 0x00 再写 0x01，把当前走时快照进 rtc_latched（随后读到的就是这一刻）
+                    if self.rtc_latch_pre && val == 0x01 { self.rtc_latched = rtc_pack(self.rtc_sec, self.rtc_halted); }
                     self.rtc_latch_pre = val == 0x00;
                 }
                 // MBC5 无模式位/锁存，写此区间忽略
@@ -304,6 +338,15 @@ impl Bus {
         self.write(addr, val as u8);
         self.write(addr.wrapping_add(1), (val >> 8) as u8);
     }
+    // MBC3 RTC 走时：宿主每帧把「真实墙钟秒数」灌进来，内部算增量推进 rtc_sec。
+    // 首帧只记基准（rtc_last_wall = Some(wall)），此后 wall 比上次大多少就推进多少秒；
+    // 若停止标志置位，或 wall 回退（宿主时钟调整），则跳过推进、只更新基准。
+    pub fn tick_rtc(&mut self, wall: u64) {
+        if self.rtc_last_wall.is_none() { self.rtc_last_wall = Some(wall); return; }
+        let last = self.rtc_last_wall.unwrap();
+        self.rtc_last_wall = Some(wall);
+        if !self.rtc_halted && wall > last { self.rtc_sec += wall - last; }
+    }
     // 装卡带：完整 ROM 存进 cart，按头部字节初始化 MBC 状态与 SRAM 大小
     pub fn load_rom(&mut self, rom: &[u8]) {
         self.cart = rom.to_vec();
@@ -316,8 +359,11 @@ impl Bus {
         self.multicart = is_mbc1_multicart(&self.cart);
         self.rom_bank = 1;
         self.ram_bank = 0;
-        self.rtc = [0; 5];
+        self.rtc_sec = 0;
+        self.rtc_halted = false;
+        self.rtc_latched = [0; 5];
         self.rtc_latch_pre = false;
+        self.rtc_last_wall = None;
     }
     // 把 SRAM 存档落盘为 .sav 文件（测试后调用验证持久化）
     pub fn save_sram(&self, path: &str) -> std::io::Result<()> {
@@ -1186,11 +1232,55 @@ mod tests {
         bus.write(0x4000, 0x08);                 // 选 RTC 寄存器 0（秒）
         assert_eq!(bus.ram_bank, 0x08);
         bus.write(0xA000, 0x2A);                 // 写 RTC 秒寄存器
-        assert_eq!(bus.rtc[0], 0x2A);
-        assert_eq!(bus.read(0xA000), 0x2A);
-        bus.write(0x4000, 0x0C);                 // 选 RTC 寄存器 4（日高8位）
-        bus.write(0xA000, 0x01);
-        assert_eq!(bus.rtc[4], 0x01);
+        assert_eq!(bus.rtc_sec, 0, "写秒寄存器不该改二进制计数（真机 RTC 写对计数不生效，只影响停止标志）");
+        assert_eq!(bus.read(0xA000), 0x00);      // 未锁存，快照全 0
+        bus.write(0x4000, 0x0C);                 // 选 RTC 寄存器 4（日高 8 位）
+        bus.write(0xA000, 0x40);                 // 写 bit6 = 停止标志
+        assert_eq!(bus.rtc_halted, true);
+    }
+
+    #[test] fn mbc3_rtc_wall_clock() {
+        let mut bus = Bus::new();
+        bus.cart = vec![0; 0x8000];
+        bus.mbc_type = 0x0F;
+        bus.ram = vec![0; 8192];
+        bus.write(0x0000, 0x0A);
+        bus.tick_rtc(1000);                      // 首帧只记基准
+        assert_eq!(bus.rtc_sec, 0);
+        bus.tick_rtc(1003);                      // 推进 3 秒
+        assert_eq!(bus.rtc_sec, 3);
+        // 锁存：写 0x00 → 0x01，把当前 3 秒快照进 rtc_latched
+        bus.write(0x6000, 0x00);
+        bus.write(0x6000, 0x01);
+        assert_eq!(bus.rtc_latched[0], 0x03, "3 秒的 BCD 应为 0x03");
+        bus.write(0x4000, 0x08);                 // 读 RTC 秒寄存器
+        assert_eq!(bus.read(0xA000), 0x03);
+        // 停止标志：写日高寄存器 bit6 = 1，走时冻结
+        bus.write(0x4000, 0x0C);
+        bus.write(0xA000, 0x40);
+        bus.tick_rtc(1009);                      // 停止期间不推进
+        assert_eq!(bus.rtc_sec, 3);
+        // 恢复走时：写 bit6 = 0
+        bus.write(0xA000, 0x00);
+        bus.tick_rtc(1010);
+        assert_eq!(bus.rtc_sec, 4);
+    }
+
+    #[test] fn mbc3_rtc_pack_carries() {
+        // 直接验 rtc_pack 的进位：3670 秒 = 1时1分10秒
+        let p = rtc_pack(3670, false);
+        assert_eq!(p[0], 0x10);                  // 10 秒
+        assert_eq!(p[1], 0x01);                  // 1 分
+        assert_eq!(p[2], 0x01);                  // 1 时
+        assert_eq!(p[3], 0x00);                  // 0 日
+        assert_eq!(p[4], 0x00);
+        // 512 天 = 日计数 9 位溢出回绕到 0，置进位标志 bit7（日高 bit0 = 0）
+        let p2 = rtc_pack(512 * 86_400 + 59 + 59 * 60 + 23 * 3600, false);
+        assert_eq!(p2[0], 0x59);                 // 59 秒
+        assert_eq!(p2[1], 0x59);                 // 59 分
+        assert_eq!(p2[2], 0x23);                 // 23 时
+        assert_eq!(p2[3], 0x00);                 // 512 & 0xFF = 0
+        assert_eq!(p2[4], 0x80);                 // bit0=0（日 9 位回绕），bit7=进位标志
     }
 
     // ===== APU 接线验证：CPU 执行 → 总线 → APU 是否连通 =====

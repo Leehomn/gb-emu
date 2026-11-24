@@ -289,6 +289,7 @@ function loop(t){
   fpsAcc+=dt; fpsN++;
   if(fpsAcc>500){ $("fpsV").textContent=Math.round(1000/(fpsAcc/fpsN)); fpsAcc=0; fpsN=0; }
   wasm.gb_set_keys(gb, curDir, curBtn);
+  if(wasm.gb_tick_rtc) wasm.gb_tick_rtc(gb, Math.floor(Date.now()/1000));   // MBC3 RTC：每帧灌墙钟秒数
   if(paused){ render(); requestAnimationFrame(loop); return; }   // 暂停：不推进内核，只保持画面
   const frames=turbo?3:1;
   for(let i=0;i<frames;i++) wasm.gb_run_frame(gb);

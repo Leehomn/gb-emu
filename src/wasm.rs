@@ -147,6 +147,13 @@ pub extern "C" fn gb_set_keys(ptr: *mut Emu, dir: u8, btn: u8) {
     }
 }
 
+/// 推进 MBC3 RTC 走时：JS 每帧把真实墙钟秒数（Date.now()/1000 取整）灌进来。
+/// 仅 MBC3+TIMER 卡带生效；首帧记基准、此后按差值推进，停止标志置位时冻结。
+#[unsafe(no_mangle)]
+pub extern "C" fn gb_tick_rtc(ptr: *mut Emu, wall: u64) {
+    unsafe { (&mut *ptr).bus.tick_rtc(wall); }
+}
+
 /// 释放模拟器（JS 侧 drop 掉实例时调，别重复调）
 #[unsafe(no_mangle)]
 pub extern "C" fn gb_free(ptr: *mut Emu) {
