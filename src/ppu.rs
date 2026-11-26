@@ -108,6 +108,14 @@ struct ObjPixel {
 pub struct Ppu {
     pub framebuffer: [[u8; SCREEN_W]; SCREEN_H],
     pub ly: u8,
+    pub(crate) cgb: bool,
+    pub(crate) vram1: Box<[u8; 0x2000]>,
+    pub(crate) bg_palette: [u8; 64],
+    pub(crate) obj_palette: [u8; 64],
+    pub(crate) hblank_epoch: u64,
+    pub(crate) obj_x_priority: bool,
+    pub color_frame: Box<[[u16; SCREEN_W]; SCREEN_H]>,
+    bg_attr: u8,
     pub(crate) oam_dma_active: bool,
 
     lcdc: u8,
@@ -129,7 +137,7 @@ pub struct Ppu {
     enable_lyc_eq_ly_irq: bool,
     stat_write_pending: Option<u8>,
 
-    bg_fifo: VecDeque<u8>,
+    bg_fifo: VecDeque<(u8, u8)>,
     obj_fifo: VecDeque<ObjPixel>,
 
     fstate: FetcherState,
@@ -174,6 +182,14 @@ impl Ppu {
         Ppu {
             framebuffer: [[0; SCREEN_W]; SCREEN_H],
             ly: 0,
+            cgb: false,
+            vram1: Box::new([0; 0x2000]),
+            bg_palette: [0xFF; 64],
+            obj_palette: [0; 64],
+            hblank_epoch: 0,
+            obj_x_priority: false,
+            color_frame: Box::new([[0x7FFF; SCREEN_W]; SCREEN_H]),
+            bg_attr: 0,
             oam_dma_active: false,
             lcdc: 0,
             last_lcdc: 0,
@@ -226,6 +242,8 @@ impl Ppu {
     }
 
     // 推进 n 个 T-cycle（Bus 保证 n 为 4 的倍数：CPU 每次访存调一次）
+    pub(crate) fn lcd_mode(&self) -> u8 { if self.lcdc & 0x80 == 0 { 0 } else { self.mode } }
+
     pub fn tick_dots(&mut self, n: u32, mem: &mut [u8]) {
         for _ in 0..n {
             self.tick_dot(mem);
@@ -275,6 +293,7 @@ impl Ppu {
         self.glitched_hblank_delay = 0;
         self.enable_lyc_eq_ly_irq = true;
         self.framebuffer = [[0; SCREEN_W]; SCREEN_H];
+        self.color_frame.fill([0x7FFF; SCREEN_W]);
     }
 
     fn turn_on(&mut self, _mem: &mut [u8]) {
@@ -349,7 +368,7 @@ impl Ppu {
                 if self.dummy_ticks == 3 {
                     // 第一个 tile 取数只为对齐，数据扔掉
                     self.bg_fifo.clear();
-                    for _ in 0..8 { self.bg_fifo.push_back(0); }
+                    for _ in 0..8 { self.bg_fifo.push_back((0, 0)); }
                     // [mealybug/m3_scx_low_3_bits] SCX 低 3 位在此刻之后锁存
                     self.pt_to_discard = mem[0xFF43] & 7;
                     self.pt_discarded = 0;
@@ -412,11 +431,27 @@ impl Ppu {
                 self.handle_pending_bg_fifo_fill();
                 let mut inc_lx = false;
                 if self.is_bg_fifo_ready_to_be_popped(mem) {
-                    let bg_pixel = self.bg_fifo.pop_front().unwrap();
+                    let (bg_pixel, bg_attr) = self.bg_fifo.pop_front().unwrap();
+                    let obj_pixel = self.obj_fifo.pop_front();
+                    let x = self.lcd_x as usize;
+                    if self.cgb && x < SCREEN_W {
+                        let obj = obj_pixel.filter(|obj| {
+                            self.lcdc & 2 != 0 && obj.color != 0
+                                && (bg_pixel == 0 || self.lcdc & 1 == 0
+                                    || (bg_attr | obj.attributes) & 0x80 == 0)
+                        });
+                        let (palette, attr, pixel) = match obj {
+                            Some(obj) => (&self.obj_palette, obj.attributes, obj.color),
+                            None => (&self.bg_palette, bg_attr, bg_pixel),
+                        };
+                        let index = usize::from((attr & 7) * 8 + pixel * 2);
+                        self.color_frame[self.ly as usize][x] =
+                            u16::from_le_bytes([palette[index], palette[index + 1]]) & 0x7FFF;
+                    }
                     // DMG：PPU 看到的 LCDC 晚 1 dot，lx==8 例外
                     let lcdc_ = if self.lx == 8 { self.lcdc } else { self.last_lcdc };
                     let mut color: Option<u8> = None;
-                    if let Some(obj) = self.obj_fifo.pop_front() {
+                    if let Some(obj) = obj_pixel {
                         let show_obj = (lcdc_ & 0x02 != 0) && obj.color != 0
                             && (!(lcdc_ & 0x01 != 0) || bg_pixel == 0 || (obj.attributes & 0x80 == 0));
                         if show_obj {
@@ -429,7 +464,6 @@ impl Ppu {
                         let bgp_ = mem[0xFF47] | self.last_bgp;
                         if lcdc_ & 0x01 != 0 { (bgp_ >> (bg_pixel * 2)) & 3 } else { 0 }
                     });
-                    let x = self.lcd_x as usize;
                     if x < SCREEN_W {
                         self.framebuffer[self.ly as usize][x] = color;
                     }
@@ -596,6 +630,7 @@ impl Ppu {
     }
 
     fn enter_hblank(&mut self) {
+        self.hblank_epoch = self.hblank_epoch.wrapping_add(1);
         if self.is_glitched_line_0 {
             self.state = State::HblankFirstLineAfterTurnOn;
             self.glitched_hblank_delay = 0;
@@ -652,7 +687,7 @@ impl Ppu {
             FetcherState::WinDataLow0 => {
                 if self.lcdc & 0x20 == 0 { self.bg_data_low_0(mem); return; }
                 self.setup_win_data_address(mem);
-                self.psf_lo = mem[self.psf_addr as usize];
+                self.psf_lo = self.tile_byte(mem, self.bg_attr, 0);
                 self.fstate = FetcherState::WinDataLow1;
             }
             FetcherState::WinDataLow1 => {
@@ -662,7 +697,7 @@ impl Ppu {
             FetcherState::WinDataHigh0 => {
                 if self.lcdc & 0x20 == 0 { self.bg_data_high_0(mem); return; }
                 self.setup_win_data_address(mem);
-                self.psf_hi = mem[self.psf_addr as usize + 1];
+                self.psf_hi = self.tile_byte(mem, self.bg_attr, 1);
                 self.fstate = FetcherState::WinDataHigh1;
             }
             FetcherState::WinDataHigh1 => { self.bgwin_data_high_1(); }
@@ -672,7 +707,7 @@ impl Ppu {
             FetcherState::ObjGetTile1 => {
                 let base = 0xFE00 + self.of_number as usize * 4;
                 self.of_tile = mem[base + 2];
-                self.of_attr = mem[base + 3] & 0xF0;   // DMG：低 4 位无用
+                self.of_attr = mem[base + 3] & if self.cgb { 0xFF } else { 0xF0 };
                 self.fstate = FetcherState::ObjDataLow0;
             }
             FetcherState::ObjDataLow0 => {
@@ -680,7 +715,7 @@ impl Ppu {
             }
             FetcherState::ObjDataLow1 => {
                 self.setup_obj_data_address(mem);
-                self.psf_lo = mem[self.psf_addr as usize];
+                self.psf_lo = self.tile_byte(mem, self.of_attr, 0);
                 self.fstate = FetcherState::ObjDataHigh0;
             }
             FetcherState::ObjDataHigh0 => {
@@ -688,7 +723,7 @@ impl Ppu {
             }
             FetcherState::ObjDataHigh1Merge => {
                 self.setup_obj_data_address(mem);
-                self.psf_hi = mem[self.psf_addr as usize + 1];
+                self.psf_hi = self.tile_byte(mem, self.of_attr, 1);
                 self.merge_obj_row();
             }
             FetcherState::Idle => {}
@@ -703,6 +738,7 @@ impl Ppu {
         let map_base = if self.lcdc & 0x08 != 0 { 0x9C00 } else { 0x9800 };
         let addr = map_base + tilemap_y * 32 + tilemap_x;
         self.bwf_tile_number = mem[addr as usize];
+        self.bg_attr = if self.cgb { self.vram1[addr as usize - 0x8000] } else { 0 };
         if std::env::var("GB_FDBG").is_ok() && self.ly == crate::DBG_LINE.with(|l| l.get()) {
             eprintln!("get_tile ly={} dot={} bwf_lx={} scx={} scy={} map_y={} tile={}", self.ly, self.dots, self.bwf_lx, mem[0xFF43], mem[0xFF42], tilemap_y, self.bwf_tile_number);
         }
@@ -713,13 +749,13 @@ impl Ppu {
         // 数据地址在低/高两相各自现算（SCY/TILE_SEL 中途改会产生位平面错位）
         // [mealybug/m3_scy_change, mealybug/m3_lcdc_tile_sel_change]
         self.setup_bg_data_address(mem);
-        self.psf_lo = mem[self.psf_addr as usize];
+        self.psf_lo = self.tile_byte(mem, self.bg_attr, 0);
         self.fstate = FetcherState::BgDataLow1;
     }
 
     fn bg_data_high_0(&mut self, mem: &mut [u8]) {
         self.setup_bg_data_address(mem);
-        self.psf_hi = mem[self.psf_addr as usize + 1];
+        self.psf_hi = self.tile_byte(mem, self.bg_attr, 1);
         self.fstate = FetcherState::BgDataHigh1;
     }
 
@@ -744,7 +780,13 @@ impl Ppu {
         let map_base = if self.lcdc & 0x40 != 0 { 0x9C00 } else { 0x9800 };
         let addr = map_base + tilemap_y as u16 * 32 + tilemap_x as u16;
         self.bwf_tile_number = mem[addr as usize];
+        self.bg_attr = if self.cgb { self.vram1[addr as usize - 0x8000] } else { 0 };
         self.fstate = FetcherState::WinGetTile1;
+    }
+
+    fn tile_byte(&self, mem: &[u8], attributes: u8, offset: usize) -> u8 {
+        let addr = self.psf_addr as usize + offset;
+        if self.cgb && attributes & 8 != 0 { self.vram1[addr - 0x8000] } else { mem[addr] }
     }
 
     fn setup_bg_data_address(&mut self, mem: &mut [u8]) {
@@ -754,6 +796,7 @@ impl Ppu {
             (0x9000i32 + TILE_BYTES as i32 * self.bwf_tile_number as i8 as i32) as u32
         };
         let tile_y = (self.ly as u32 + mem[0xFF42] as u32) & 7;
+        let tile_y = if self.bg_attr & 0x40 != 0 { tile_y ^ 7 } else { tile_y };
         self.psf_addr = (vram_tile + 2 * tile_y) as u16;
     }
 
@@ -764,6 +807,7 @@ impl Ppu {
             (0x9000i32 + TILE_BYTES as i32 * self.bwf_tile_number as i8 as i32) as u32
         };
         let tile_y = (self.w_wly & 7) as u32;
+        let tile_y = if self.bg_attr & 0x40 != 0 { tile_y ^ 7 } else { tile_y };
         self.psf_addr = (vram_tile + 2 * tile_y) as u16;
     }
 
@@ -794,6 +838,7 @@ impl Ppu {
             let opaque_new = pixels[i] != 0;
             let overwrite = (opaque_new && fifo.color == 0)
                 || (opaque_new && fifo.color != 0
+                    && (!self.cgb || !self.obj_x_priority || self.lx == fifo.x)
                     && self.of_number < fifo.number);
             if overwrite {
                 self.obj_fifo[i] = ObjPixel {
@@ -846,8 +891,8 @@ impl Ppu {
             let can_push = self.bg_fifo.is_empty();
             if can_push {
                 // 窗口 00 像素毛刺：本帧窗口条件成立过、lx 恰为 WX 时，推入一个 0 像素
-                if self.w_active_for_frame && self.lx == mem[0xFF4B] && !self.w_just_activated {
-                    self.bg_fifo.push_back(0);
+                if !self.cgb && self.w_active_for_frame && self.lx == mem[0xFF4B] && !self.w_just_activated {
+                    self.bg_fifo.push_back((0, 0));
                     return;
                 }
                 self.pending_bg_fifo_fill = true;
@@ -878,9 +923,9 @@ impl Ppu {
             self.pending_bg_fifo_fill = false;
             self.bg_fifo.clear();
             for i in 0..8u32 {
-                let bit = 7 - i;
+                let bit = if self.bg_attr & 0x20 != 0 { i } else { 7 - i };
                 let px = ((self.psf_lo >> bit) & 1) | (((self.psf_hi >> bit) & 1) << 1);
-                self.bg_fifo.push_back(px);
+                self.bg_fifo.push_back((px, self.bg_attr));
             }
         }
     }
@@ -1014,7 +1059,7 @@ mod tests {
         ppu.state = State::PixelTransferLx8;
         ppu.lx = 8;
         ppu.fstate = FetcherState::Idle;
-        ppu.bg_fifo.extend([0; 8]);
+        ppu.bg_fifo.extend([(0, 0); 8]);
         ppu.push_enabled = true;
         ppu.oam_entries[8].push((0, 16));
 

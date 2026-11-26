@@ -18,7 +18,7 @@
 | PPU | **逐 dot（T-cycle）状态机**：37 个主状态 + 19 个取数状态 + 双 FIFO，BG/Window/OBJ 三层，含 SCX/SCY 滚动、图块映射、背景调色板切换毛刺、逐周期 OAM DMA、STAT 中断 |
 | MBC | MBC1/MBC3/MBC5 换页 + SRAM 存档 + RTC 寄存器（.sav 落盘 / 网页 localStorage） |
 | APU | 4 通道（方波×2 + 波形 + 噪声）+ 帧序列器，WAV 输出 / 网页 Web Audio |
-| 验证 | Blargg CPU 指令考卷 **75/75** + Mooneye MBC1 **13/13** + MBC5 **8/8** + cargo test **58 项** + Mooneye OAM DMA **6/6** + Mealybug Tearoom **24/24** |
+| 验证 | Blargg CPU 指令考卷 **75/75** + Mooneye MBC1 **13/13** + MBC5 **8/8** + cargo test **58 项单测 + 3 项 GBC 测试** + Mooneye OAM DMA **6/6** + Mealybug Tearoom **24/24** |
 
 ## 怎么跑
 
@@ -77,6 +77,12 @@ python -X utf8 .\_mealybug\ascii_diff.py m3_scy_change
 ```
 
 这套测试比 Blargg 难得多：它专测「寄存器在一行渲染中途被改写」这类边界时序，需要 PPU 逐 dot 推进才能还原。旧版按扫描线整行渲染，一张都过不了。
+
+### Game Boy Color 模式
+
+加载带 CGB 标记的卡带时，桌面和网页自动选择彩色模式。支持背景、窗口、精灵调色板和优先级，显存及工作内存分区，双倍速切换，以及普通和 HBlank 显存 DMA。
+
+图形验证：[cgb-acid2](https://github.com/mattcurrie/cgb-acid2) 参考图 23,040 像素一致。黑白模式仍用 Mealybug DMG 套件回归。彩色模式的硬件边界时序、红外、串口通信和商业卡带兼容性尚未全面验证。
 
 ## 目录结构
 

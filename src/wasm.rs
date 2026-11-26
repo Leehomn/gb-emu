@@ -58,6 +58,7 @@ pub extern "C" fn gb_load(ptr: *mut Emu, rom_ptr: *const u8, rom_len: usize) {
         let emu = &mut *ptr;
         let rom = std::slice::from_raw_parts(rom_ptr, rom_len);
         emu.bus.load_rom(rom);
+        emu.cpu = Cpu::new();
     }
 }
 
@@ -66,9 +67,9 @@ pub extern "C" fn gb_load(ptr: *mut Emu, rom_ptr: *const u8, rom_len: usize) {
 pub extern "C" fn gb_run_frame(ptr: *mut Emu) {
     unsafe {
         let emu = &mut *ptr;
-        let mut spent = 0u32;
-        while spent < FRAME_CYCLES {
-            spent += emu.cpu.step(&mut emu.bus);   // PPU 内嵌在 Bus 里，随访存逐 M-cycle 推进
+        let start = emu.bus.video_dots;
+        while emu.bus.video_dots - start < u64::from(FRAME_CYCLES) {
+            emu.cpu.step(&mut emu.bus);
         }
         for y in 0..ppu::SCREEN_H {
             for x in 0..ppu::SCREEN_W {
@@ -83,6 +84,14 @@ pub extern "C" fn gb_run_frame(ptr: *mut Emu) {
 #[unsafe(no_mangle)]
 pub extern "C" fn gb_screen_ptr(ptr: *mut Emu) -> *const u8 {
     unsafe { (&*ptr).screen.as_ptr() }
+}
+
+/// GBC 彩色缓冲使用小端 RGB555，黑白模式返回空指针。
+#[unsafe(no_mangle)]
+pub extern "C" fn gb_color_screen_ptr(ptr: *const Emu) -> *const u16 {
+    let emu = unsafe { &*ptr };
+    if emu.bus.is_cgb() { emu.bus.ppu.color_frame.as_ptr().cast() }
+    else { std::ptr::null() }
 }
 
 // ---------- 音频：指针 + 长度 + 清空 三步协议 ----------

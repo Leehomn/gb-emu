@@ -92,7 +92,21 @@ struct OamDma {
     dots: u32,
 }
 
+#[derive(Default)]
+struct CgbBus {
+    vram_bank: u8,
+    wram_bank: u8,
+    wram: Vec<u8>,
+    double_speed: bool,
+    speed_armed: bool,
+    hdma_blocks: u8,
+    hdma_active: bool,
+    hdma_epoch: u64,
+}
+
 pub struct Bus {
+    cgb: Option<CgbBus>,
+    pub video_dots: u64,
     pub mem: Vec<u8>,
     pub cart: Vec<u8>,        // 完整卡带 ROM（含 MBC 换页的全部 bank）
     pub ram: Vec<u8>,         // SRAM 存档（大小由卡带头 0x149 字节定）
@@ -165,6 +179,8 @@ fn rtc_pack(secs: u64, halted: bool) -> [u8; 5] {
 impl Bus {
     pub fn new() -> Self {
         let mut b = Bus {
+            cgb: None,
+            video_dots: 0,
             mem: vec![0; 0x10000],
             cart: Vec::new(), ram: Vec::new(), mbc_type: 0,
             ramg: false, bank1: 1, bank2: 0, mode: false, multicart: false,
@@ -191,13 +207,22 @@ impl Bus {
 
     fn dma_blocks_cpu(&self, addr: u16) -> bool {
         // DMA 寄存器在搬运期间仍可读写。
-        self.oam_dma.active.is_some()
-            && addr != OAM_DMA_REG
-            && !(0xFF80..=0xFFFE).contains(&addr)
+        let Some(transfer) = self.oam_dma.active.as_ref() else { return false; };
+        if addr == OAM_DMA_REG || (0xFF80..=0xFFFE).contains(&addr) { return false; }
+        if !self.is_cgb() { return true; }
+        // CGB 把卡带、显存和工作内存放在不同总线上。
+        let area = |addr| match addr {
+            0x0000..=0x7FFF | 0xA000..=0xBFFF => 1,
+            0x8000..=0x9FFF => 2,
+            0xC000..=0xFDFF => 3,
+            _ => 0,
+        };
+        (0xFE00..=0xFE9F).contains(&addr) || area(addr) == area(transfer.source)
     }
 
     // DMA 使用同一套卡带和内存映射，读取本身不走 CPU 时钟或访问限制。
     fn read_untimed(&mut self, addr: u16) -> u8 {
+        if let Some(value) = self.read_cgb(addr) { return value; }
         match addr {
             0x0000..=0x7FFF => self.read_rom(addr),
             0xA000..=0xBFFF => self.read_ram(addr),
@@ -291,6 +316,7 @@ impl Bus {
         self.mcycle();
     }
     fn write_untimed(&mut self, addr: u16, val: u8) {
+        if self.write_cgb(addr, val) { return; }
         // 卡带区写入 = MBC 命令（不是真往 ROM 写，是给换页芯片下指令）
         let is_mbc1 = matches!(self.mbc_type, 0x01 | 0x02 | 0x03);
         let is_mbc3 = self.is_mbc3();
@@ -378,22 +404,147 @@ impl Bus {
         self.mcycles += 1;
         self.advance(4);
     }
+    pub fn is_cgb(&self) -> bool { self.cgb.is_some() }
+
+    fn read_cgb(&self, addr: u16) -> Option<u8> {
+        let c = self.cgb.as_ref()?;
+        Some(match addr {
+            0x8000..=0x9FFF if c.vram_bank == 1 => self.ppu.vram1[usize::from(addr - 0x8000)],
+            0xD000..=0xDFFF | 0xF000..=0xFDFF =>
+                c.wram[(usize::from(c.wram_bank.max(1)) - 1) * 0x1000 + usize::from(addr & 0xFFF)],
+            0xE000..=0xEFFF => self.mem[usize::from(addr - 0x2000)],
+            0xFF4D => 0x7E | (u8::from(c.double_speed) << 7) | u8::from(c.speed_armed),
+            0xFF4F => 0xFE | c.vram_bank,
+            0xFF51..=0xFF54 => 0xFF,
+            0xFF55 => (if c.hdma_active { 0 } else { 0x80 }) | c.hdma_blocks.wrapping_sub(1) & 0x7F,
+            0xFF68 | 0xFF6A => 0x40 | self.mem[usize::from(addr)],
+            0xFF69 | 0xFF6B => {
+                if self.ppu.lcd_mode() == 3 { return Some(0xFF); }
+                let index = usize::from(self.mem[usize::from(addr - 1)] & 63);
+                if addr == 0xFF69 { self.ppu.bg_palette[index] } else { self.ppu.obj_palette[index] }
+            }
+            0xFF6C => 0xFE | u8::from(self.ppu.obj_x_priority),
+            0xFF70 => 0xF8 | c.wram_bank,
+            _ => return None,
+        })
+    }
+
+    fn write_cgb(&mut self, addr: u16, value: u8) -> bool {
+        let Some(c) = self.cgb.as_mut() else { return false; };
+        match addr {
+            0x8000..=0x9FFF if c.vram_bank == 1 => self.ppu.vram1[usize::from(addr - 0x8000)] = value,
+            0xD000..=0xDFFF | 0xF000..=0xFDFF =>
+                c.wram[(usize::from(c.wram_bank.max(1)) - 1) * 0x1000 + usize::from(addr & 0xFFF)] = value,
+            0xE000..=0xEFFF => self.mem[usize::from(addr - 0x2000)] = value,
+            0xFF4D => c.speed_armed = value & 1 != 0,
+            0xFF4F => c.vram_bank = value & 1,
+            0xFF51..=0xFF54 => self.mem[usize::from(addr)] = value,
+            0xFF55 => {
+                if c.hdma_active {
+                    if value & 0x80 == 0 { c.hdma_active = false; }
+                    return true;
+                }
+                c.hdma_blocks = (value & 0x7F) + 1;
+                if value & 0x80 != 0 {
+                    c.hdma_active = true;
+                    c.hdma_epoch = self.ppu.hblank_epoch;
+                } else {
+                    let blocks = c.hdma_blocks;
+                    for _ in 0..blocks { self.copy_cgb_dma_block(); }
+                    let clocks = if self.cpu_is_fast() { 64 } else { 32 };
+                    self.advance(u32::from(blocks) * clocks);
+                }
+            }
+            0xFF68 | 0xFF6A => self.mem[usize::from(addr)] = value & 0xBF,
+            0xFF69 | 0xFF6B => {
+                let index_reg = usize::from(addr - 1);
+                let index = usize::from(self.mem[index_reg] & 63);
+                if self.ppu.lcd_mode() != 3 {
+                    let palette = if addr == 0xFF69 { &mut self.ppu.bg_palette } else { &mut self.ppu.obj_palette };
+                    palette[index] = value;
+                }
+                if self.mem[index_reg] & 0x80 != 0 {
+                    self.mem[index_reg] = 0x80 | ((index as u8 + 1) & 63);
+                }
+            }
+            0xFF6C => self.ppu.obj_x_priority = value & 1 != 0,
+            0xFF70 => c.wram_bank = value & 7,
+            _ => return false,
+        }
+        true
+    }
+
+    fn copy_cgb_dma_block(&mut self) {
+        let source = u16::from_be_bytes([self.mem[0xFF51], self.mem[0xFF52] & 0xF0]);
+        let dest = u16::from_be_bytes([self.mem[0xFF53] & 0x1F, self.mem[0xFF54] & 0xF0]);
+        let bank = self.cgb.as_ref().unwrap().vram_bank;
+        for offset in 0..16 {
+            let addr = source.wrapping_add(offset);
+            let value = if matches!(addr, 0x0000..=0x7FFF | 0xA000..=0xDFFF) {
+                self.read_untimed(addr)
+            } else { 0xFF };
+            let index = usize::from(dest + offset);
+            if bank == 0 { self.mem[0x8000 + index] = value; }
+            else { self.ppu.vram1[index] = value; }
+        }
+        let [hi, lo] = source.wrapping_add(16).to_be_bytes();
+        self.mem[0xFF51] = hi;
+        self.mem[0xFF52] = lo;
+        let [hi, lo] = ((dest + 16) & 0x1FFF).to_be_bytes();
+        self.mem[0xFF53] = hi;
+        self.mem[0xFF54] = lo;
+        let c = self.cgb.as_mut().unwrap();
+        c.hdma_blocks -= 1;
+        if c.hdma_blocks == 0 { c.hdma_active = false; }
+    }
+
+    fn cpu_is_fast(&self) -> bool {
+        self.cgb.as_ref().is_some_and(|c| c.double_speed)
+    }
+
+    fn switch_cgb_speed(&mut self) {
+        if let Some(c) = self.cgb.as_mut().filter(|c| c.speed_armed) {
+            c.double_speed = !c.double_speed;
+            c.speed_armed = false;
+            self.mem[0xFF04] = 0;
+            self.div_acc = 0;
+        }
+    }
+
+    fn tick_video(&mut self, t: u32) {
+        let dots = if self.cpu_is_fast() { t / 2 } else { t };
+        self.video_dots += u64::from(dots);
+        self.ppu.tick_dots(dots, &mut self.mem);
+        self.apu.tick(dots);
+    }
+
     fn advance(&mut self, t: u32) {
         if t == 0 { return; }
         let mut remaining = t;
+        let mut stalls = 0;
         // 有 DMA 时逐机器周期交错推进，空闲时沿用 PPU 的批量推进。
-        while remaining > 0 && (self.oam_dma.start_cycles > 0 || self.oam_dma.active.is_some()) {
+        while remaining > 0 && (self.oam_dma.start_cycles > 0 || self.oam_dma.active.is_some()
+            || self.cgb.as_ref().is_some_and(|c| c.hdma_active)) {
             let dots = remaining.min(DOTS_PER_M_CYCLE - self.oam_dma.dots);
-            self.ppu.tick_dots(dots, &mut self.mem);
+            self.tick_video(dots);
             self.oam_dma.dots += dots;
             remaining -= dots;
             if self.oam_dma.dots == DOTS_PER_M_CYCLE {
                 self.oam_dma.dots = 0;
                 self.tick_oam_dma();
+                let epoch = self.ppu.hblank_epoch;
+                if let Some(c) = self.cgb.as_mut().filter(|c| c.hdma_active && c.hdma_epoch != epoch) {
+                    c.hdma_epoch = epoch;
+                    self.copy_cgb_dma_block();
+                    let stall = if self.cpu_is_fast() { 64 } else { 32 };
+                    remaining += stall;
+                    stalls += stall;
+                }
             }
         }
-        self.ppu.tick_dots(remaining, &mut self.mem);
-        self.tick_periph(t);
+        self.tick_video(remaining);
+        let clocks = t + stalls;
+        self.tick_periph(clocks);
     }
 
     fn tick_oam_dma(&mut self) {
@@ -422,7 +573,6 @@ impl Bus {
         self.ppu.oam_dma_active = self.oam_dma.active.is_some();
     }
     fn tick_periph(&mut self, t: u32) {
-        self.apu.tick(t);
         // DIV：每 256 周期 +1
         self.div_acc += t;
         while self.div_acc >= 256 {
@@ -463,6 +613,11 @@ impl Bus {
     }
     // 装卡带：完整 ROM 存进 cart，按头部字节初始化 MBC 状态与 SRAM 大小
     pub fn load_rom(&mut self, rom: &[u8]) {
+        let cgb = rom.get(0x143).is_some_and(|flag| matches!(flag, 0x80 | 0xC0));
+        self.cgb = cgb.then(|| CgbBus { wram: vec![0; 7 * 0x1000], wram_bank: 1, ..CgbBus::default() });
+        self.ppu = Ppu::new();
+        self.ppu.cgb = cgb;
+        self.video_dots = 0;
         self.cart = rom.to_vec();
         self.mbc_type = rom.get(0x147).copied().unwrap_or(0);
         self.ram = vec![0; ram_size_for(rom)];
@@ -739,6 +894,9 @@ impl Cpu {
             self.cycles += t as u64;
             return 4 + t;
         }
+        if self.cycles == 0 && self.pc == 0x0100 && bus.is_cgb() {
+            self.reg = Registers { a: 0x11, f: 0x80, b: 0, c: 0, d: 0xFF, e: 0x56, h: 0, l: 0x0D };
+        }
         let op = self.fetch8(bus);
         // Mooneye 测试的 magic_breakpoint = 0x40 (LD B,B)。执行它时 B 已装好结果：
         // 3=通过，0x42=失败。抓到就记下，供验收测试判定。
@@ -747,7 +905,7 @@ impl Cpu {
         }
         let t = match op {
             0x00 => 4,                                       // NOP
-            0x10 => { let _ = self.fetch8(bus); 4 }          // STOP：考卷用它在失败处刹车，先当2字节NOP
+            0x10 => { let _ = self.fetch8(bus); bus.switch_cgb_speed(); if bus.is_cgb() { 8 } else { 4 } } // STOP：切换已准备好的 CGB 速度
             0x76 => { self.halted = true; 4 }                // HALT
             0xF3 => { self.ime = false; self.ei_pending = 0; 4 }           // DI
             0xFB => { self.ei_pending = 2; 4 }                // EI：下一条指令结束后才真正打开

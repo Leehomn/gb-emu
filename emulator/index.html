@@ -242,11 +242,15 @@ const wasmReady = (async()=>{
 
 // 渲染：读 wasm 的 framebuffer（每字节色号 0~3，行优先 160×144）
 function render(){
-  const ptr=wasm.gb_screen_ptr(gb);
-  const fb=new Uint8Array(mem.buffer, ptr, 160*144);
+  const colorPtr=wasm.gb_color_screen_ptr?.(gb) || 0;
+  const fb=colorPtr ? new Uint16Array(mem.buffer, colorPtr, 160*144)
+                    : new Uint8Array(mem.buffer, wasm.gb_screen_ptr(gb), 160*144);
   const pal=palette();
+  const rgb5=(v)=>((v&31)<<3)|((v&31)>>2);
   for(let y=0;y<144;y++)for(let x=0;x<160;x++){
-    const c=hexToRgb(pal[fb[y*160+x]]);
+    const pixel=fb[y*160+x];
+    const c=colorPtr ? [rgb5(pixel), rgb5(pixel>>5), rgb5(pixel>>10)]
+                     : hexToRgb(pal[pixel]);
     for(let sy=0;sy<SCALE;sy++)for(let sx=0;sx<SCALE;sx++){
       const idx=((y*SCALE+sy)*W+x*SCALE+sx)*4;
       imgData.data[idx]=c[0]; imgData.data[idx+1]=c[1]; imgData.data[idx+2]=c[2]; imgData.data[idx+3]=255;

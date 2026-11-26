@@ -23,14 +23,14 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "--play") {
-        let rom_path = args.iter().find(|a| a.ends_with(".gb")).expect("要指定 ROM 文件");
+        let rom_path = args.iter().find(|a| a.to_ascii_lowercase().ends_with(".gb") || a.to_ascii_lowercase().ends_with(".gbc")).expect("要指定 ROM 文件");
         play(rom_path);
         return;
     }
     // mealybug tearoom tests：跑到 LD B,B(0x40) 软件断点时把 framebuffer dump 成原始色号字节，
     // 供外部脚本与 expected 标准答案 PNG 逐像素比对。用法：--mealybug out.raw
     if args.iter().any(|a| a == "--mealybug") {
-        let rom_path = args.iter().find(|a| a.ends_with(".gb")).expect("要指定 ROM 文件");
+        let rom_path = args.iter().find(|a| a.to_ascii_lowercase().ends_with(".gb") || a.to_ascii_lowercase().ends_with(".gbc")).expect("要指定 ROM 文件");
         let out = args.iter().position(|a| a == "--mealybug").and_then(|i| args.get(i + 1)).cloned();
         mealybug_shot(rom_path, out.as_deref());
         return;
@@ -96,7 +96,7 @@ fn main() {
                     }
                 }
             }
-            save_ppm(&path, &bus.ppu.framebuffer);
+            save_ppm(&path, &bus);
             println!("截图已存：{}", path);
         }
         if let Some(path) = wav_out {
@@ -197,15 +197,16 @@ fn play(rom_path: &str) {
         if window.is_key_down(Key::Enter) { bus.joypad_btn &= !0x08; }
 
         // 跑一帧：70224 周期
-        let mut spent = 0u32;
-        while spent < 70224 {
-            spent += cpu.step(&mut bus);   // PPU 内嵌在 Bus 里
+        let start = bus.video_dots;
+        while bus.video_dots - start < 70224 {
+            cpu.step(&mut bus);
         }
 
         // 涂色上屏
         for y in 0..ppu::SCREEN_H {
             for x in 0..ppu::SCREEN_W {
-                let c = palette[bus.ppu.framebuffer[y][x] as usize];
+                let c = if bus.is_cgb() { rgb555(bus.ppu.color_frame[y][x]) }
+                    else { palette[bus.ppu.framebuffer[y][x] as usize] };
                 for sy in 0..scale {
                     for sx in 0..scale {
                         pixels[(y * scale + sy) * w + x * scale + sx] = c;
@@ -251,7 +252,12 @@ fn mealybug_shot(rom_path: &str, out: Option<&str>) {
 }
 
 // 把 framebuffer 存成 PPM 图片（GameBoy 四档灰度，放大4倍方便看）
-fn save_ppm(path: &str, fb: &[[u8; ppu::SCREEN_W]; ppu::SCREEN_H]) {
+fn rgb555(color: u16) -> u32 {
+    let expand = |v: u16| u32::from(((v & 31) << 3) | ((v & 31) >> 2));
+    (expand(color) << 16) | (expand(color >> 5) << 8) | expand(color >> 10)
+}
+
+fn save_ppm(path: &str, bus: &Bus) {
     let scale = 4;
     let (w, h) = (ppu::SCREEN_W * scale, ppu::SCREEN_H * scale);
     let mut out = format!("P3\n{} {}\n255\n", w, h);
@@ -259,8 +265,10 @@ fn save_ppm(path: &str, fb: &[[u8; ppu::SCREEN_W]; ppu::SCREEN_H]) {
     for y in 0..ppu::SCREEN_H {
         for _sy in 0..scale {
             for x in 0..ppu::SCREEN_W {
-                let c = shades[fb[y][x] as usize];
-                for _sx in 0..scale { out.push_str(&format!("{c} {c} {c}\n")); }
+                let rgb = if bus.is_cgb() { rgb555(bus.ppu.color_frame[y][x]) }
+                    else { shades[bus.ppu.framebuffer[y][x] as usize] * 0x010101 };
+                let (r, g, b) = (rgb >> 16, rgb >> 8 & 255, rgb & 255);
+                for _sx in 0..scale { out.push_str(&format!("{r} {g} {b}\n")); }
             }
         }
     }
