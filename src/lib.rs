@@ -315,9 +315,8 @@ impl Bus {
             0xFF07 => { self.tac = val & 7; self.mem[0xFF07] = val; return; }
             0xFF0F => { self.mem[0xFF0F] = val & 0x1F; return; }           // IF 低5位
             0xFF44 => { return; }                                          // LY 只读
-            0xFF40 => { self.ppu.write_lcdc(val, &mut self.mem); return; }  // LCDC：开关机即时生效，其余位由 PPU 内部副本延迟 1 dot 使用
+            0xFF40 => { self.ppu.write_lcdc(val, &mut self.mem); return; }  // LCDC：写入 PPU 和可读寄存器
             0xFF41 => { self.ppu.write_stat(val, &mut self.mem); return; }  // STAT：DMG 写入延迟 1 dot，期间所有中断使能全开
-            0xFF48 | 0xFF49 => { self.ppu.write_obp(addr, val, &mut self.mem); return; }  // OBP0/OBP1：DMG 写入延迟 1 dot（m3_obp0_change）
             0xFF46 => {                                                    // DMA：把 XX00~XX9F 搬到 OAM
                 let src = (val as u16) << 8;
                 for i in 0..0xA0u16 {

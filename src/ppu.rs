@@ -115,10 +115,6 @@ pub struct Ppu {
     last_wx: u8,
     last_ly: u8,
     last_lyc: u8,
-    // OBP0/OBP1 写延迟：DMG 上写入经 MMIO 在第 2 个 T-cycle（t1）才落地，
-    // 精灵取色在写周期的第 1 个 dot 仍应看到旧值（对齐 m3_obp0_change）。
-    pending_obp0: Option<u8>,
-    pending_obp1: Option<u8>,
 
     pub state: State,
     pub dots: u32,
@@ -183,8 +179,6 @@ impl Ppu {
             last_wx: 0,
             last_ly: 0,
             last_lyc: 0,
-            pending_obp0: None,
-            pending_obp1: None,
             state: State::OamScanAfterTurnOn,
             dots: 0,
             lx: 0,
@@ -265,14 +259,6 @@ impl Ppu {
         // DMG：STAT 写入 1 dot 后生效；期间表现为所有中断使能全开
         self.stat_write_pending = Some(val);
         mem[0xFF41] |= 0xF8;
-    }
-
-    // OBP0/OBP1 写延迟：写入先暂存，等下一个 dot（t1 落地）才真正写进 mem。
-    // 精灵取色读 mem[0xFF48]/mem[0xFF49] 时，写周期第 1 个 dot 仍看到旧值。
-    pub fn write_obp(&mut self, addr: u16, val: u8, mem: &mut [u8]) {
-        if addr == 0xFF48 { self.pending_obp0 = Some(val); }
-        else { self.pending_obp1 = Some(val); }
-        // 注意：mem 里暂不写，等 tick_dot 的 tick_pending_write 落地
     }
 
     fn turn_off(&mut self, mem: &mut [u8]) {
@@ -879,7 +865,8 @@ impl Ppu {
                 let e = self.oam_entries[self.lx as usize].remove(0);
                 self.of_number = e.0;
                 self.of_y = e.1;
-                self.fstate = FetcherState::ObjGetTile0;
+                // 精灵预取的第一拍与背景推送重叠，下一拍直接读取 OAM。
+                self.fstate = FetcherState::ObjGetTile1;
             }
         }
     }
@@ -998,12 +985,6 @@ impl Ppu {
         if let Some(val) = self.stat_write_pending.take() {
             mem[0xFF41] = (mem[0xFF41] & 0x07) | (val & 0xF8);
         }
-        if let Some(val) = self.pending_obp0.take() {
-            mem[0xFF48] = val;
-        }
-        if let Some(val) = self.pending_obp1.take() {
-            mem[0xFF49] = val;
-        }
     }
 
     fn tick_stat(&mut self, mem: &mut [u8]) {
@@ -1013,5 +994,33 @@ impl Ppu {
         let mode = if force_hblank { 0 } else { self.mode };
         let lyc = if self.is_lyc_eq_ly() { 0x04 } else { 0 };
         mem[0xFF41] = (mem[0xFF41] & 0xF8) | lyc | (mode & 3);
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sprite_fetch_starts_on_the_bg_push_dot() {
+        let mut ppu = Ppu::new();
+        let mut mem = vec![0; 0x10000];
+        mem[0x8000..0x8002].fill(0xFF);
+        mem[0xFF48] = 0xE4;
+        ppu.write_lcdc(0x93, &mut mem);
+        ppu.state = State::PixelTransferLx8;
+        ppu.lx = 8;
+        ppu.fstate = FetcherState::Idle;
+        ppu.bg_fifo.extend([0; 8]);
+        ppu.push_enabled = true;
+        ppu.oam_entries[8].push((0, 16));
+
+        // 背景推送与精灵取数的第一拍重叠，第七拍输出第一个像素。
+        ppu.tick_dots(6, &mut mem);
+        assert_eq!(ppu.lcd_x, 0);
+        ppu.tick_dot(&mut mem);
+        assert_eq!(ppu.lcd_x, 1);
+        assert_eq!(ppu.framebuffer[0][0], 3);
     }
 }

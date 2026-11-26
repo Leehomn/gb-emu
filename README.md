@@ -15,10 +15,10 @@
 | 中断 | VBlank / LCD / Timer / Serial / Joypad 五个向量，IME + IE/IF 逻辑 |
 | 定时器 | DIV + TIMA/TMA/TAC，按 TAC 分频累加、溢出回装 |
 | 串口 | 0xFF01/0xFF02，把测试 ROM 的 `ok` 结果吐到终端 |
-| PPU | **逐 dot（T-cycle）状态机**：37 个主状态 + 19 个取数状态 + 双 FIFO，BG/Window/OBJ 三层，含 SCX/SCY 滚动、图块映射、调色板 1-dot 延迟、DMA、STAT 中断 |
+| PPU | **逐 dot（T-cycle）状态机**：37 个主状态 + 19 个取数状态 + 双 FIFO，BG/Window/OBJ 三层，含 SCX/SCY 滚动、图块映射、背景调色板切换毛刺、DMA、STAT 中断 |
 | MBC | MBC1/MBC3/MBC5 换页 + SRAM 存档 + RTC 寄存器（.sav 落盘 / 网页 localStorage） |
 | APU | 4 通道（方波×2 + 波形 + 噪声）+ 帧序列器，WAV 输出 / 网页 Web Audio |
-| 验证 | Blargg CPU 指令考卷 **75/75** + Mooneye MBC1 **13/13** + MBC5 **8/8** + cargo test **55 项** + Mealybug Tearoom **12/24**（进行中） |
+| 验证 | Blargg CPU 指令考卷 **75/75** + Mooneye MBC1 **13/13** + MBC5 **8/8** + cargo test **56 项** + Mealybug Tearoom **24/24** |
 
 ## 怎么跑
 
@@ -59,9 +59,9 @@ node verify_homebrew.js
 
 跑 500 万条指令后检查 PPU 是否画出内容。
 
-### Mealybug Tearoom Tests（PPU 时序考卷，进行中）
+### Mealybug Tearoom Tests（PPU 时序考卷）
 
-24 张标准答案逐像素比对，当前 **12/24 通过**。
+24 张标准答案逐像素比对，DMG 套件 **24/24 通过**。
 
 ```powershell
 # 前置：把测试 ROM 放进 _mealybug/extracted/、标准答案 PNG 放进 _mealybug/repo/expected/DMG-blob/
@@ -124,7 +124,7 @@ CHIP-8（35 条指令，Python）
   → MBC3/MBC5 换页 + RTC 寄存器（Mooneye MBC5 8 卷全过）
   → APU 音频（4 通道 + 帧序列器）
   → 网页版跑开源游戏（Adjustris / 2048 / 扫雷），能玩有声
-  → PPU 逐 dot 重写（Mealybug 时序考卷，进行中 12/24）
+  → PPU 逐 dot 重写（Mealybug 时序考卷 24/24）
 ```
 
 ## 里程碑
@@ -136,4 +136,4 @@ CHIP-8（35 条指令，Python）
 - [x] ⑤ 音频（APU 4 通道 + 帧序列器）
 - [x] ⑥ MBC1 换页 + SRAM 存档（Mooneye 13 卷全过）
 - [x] ⑦ MBC3/MBC5 换页 + RTC 寄存器（Mooneye MBC5 8 卷全过）
-- [ ] ⑧ PPU 逐 dot 时序：Mealybug Tearoom **12/24**（剩余 12 张见 `_mealybug/compare.py` 输出）
+- [x] ⑧ PPU 逐 dot 时序：Mealybug Tearoom DMG 套件 **24/24**
