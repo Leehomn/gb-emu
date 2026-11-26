@@ -27,6 +27,14 @@ fn main() {
         play(rom_path);
         return;
     }
+    // mealybug tearoom tests：跑到 LD B,B(0x40) 软件断点时把 framebuffer dump 成原始色号字节，
+    // 供外部脚本与 expected 标准答案 PNG 逐像素比对。用法：--mealybug out.raw
+    if args.iter().any(|a| a == "--mealybug") {
+        let rom_path = args.iter().find(|a| a.ends_with(".gb")).expect("要指定 ROM 文件");
+        let out = args.iter().position(|a| a == "--mealybug").and_then(|i| args.get(i + 1)).cloned();
+        mealybug_shot(rom_path, out.as_deref());
+        return;
+    }
     if args.len() > 1 {
         let rom = std::fs::read(&args[1]).expect("读不到 ROM 文件");
         let mut bus = Bus::new();
@@ -211,6 +219,35 @@ fn play(rom_path: &str) {
         let elapsed = t0.elapsed();
         if elapsed < frame_time { std::thread::sleep(frame_time - elapsed); }
     }
+}
+
+// mealybug tearoom tests：跑到 LD B,B(0x40) 断点时，把 framebuffer 的 160×144 色号(0~3)
+// 逐字节 dump 成 .raw，供外部 Python 脚本映射成灰度后与 expected 标准答案 PNG 逐像素比对。
+fn mealybug_shot(rom_path: &str, out: Option<&str>) {
+    if std::env::var("GB_TRACE").is_ok() { gb_emu::set_trace(true); }
+    if let Ok(l) = std::env::var("GB_LINE") { gb_emu::set_dbg_line(l.parse().unwrap_or(255)); }
+    let rom = std::fs::read(rom_path).expect("读不到 ROM 文件");
+    let mut bus = Bus::new();
+    bus.load_rom(&rom);
+    let mut cpu = Cpu::new();
+    println!("mealybug 开跑：{}（{} 字节），等 LD B,B 断点……", rom_path, rom.len());
+    for _ in 0..2_000_000_000u64 {
+        cpu.step(&mut bus);
+        // 0x40(LD B,B) 首次执行 = 测试的软件断点（mooneye_result 只在 0x40 时被置位）
+        if cpu.mooneye_result.is_some() {
+            let path = out.unwrap_or("mealybug.raw");
+            let mut raw = Vec::with_capacity(ppu::SCREEN_W * ppu::SCREEN_H);
+            for y in 0..ppu::SCREEN_H {
+                for x in 0..ppu::SCREEN_W {
+                    raw.push(bus.ppu.framebuffer[y][x]);
+                }
+            }
+            std::fs::write(path, &raw).expect("写 raw 失败");
+            println!("断点命中，已 dump {} 字节色号到 {}", raw.len(), path);
+            return;
+        }
+    }
+    println!("跑满 20 亿条指令仍未见 LD B,B 断点，疑似卡死或测试异常");
 }
 
 // 把 framebuffer 存成 PPM 图片（GameBoy 四档灰度，放大4倍方便看）
