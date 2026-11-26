@@ -15,10 +15,10 @@
 | 中断 | VBlank / LCD / Timer / Serial / Joypad 五个向量，IME + IE/IF 逻辑 |
 | 定时器 | DIV + TIMA/TMA/TAC，按 TAC 分频累加、溢出回装 |
 | 串口 | 0xFF01/0xFF02，把测试 ROM 的 `ok` 结果吐到终端 |
-| PPU | **逐 dot（T-cycle）状态机**：37 个主状态 + 19 个取数状态 + 双 FIFO，BG/Window/OBJ 三层，含 SCX/SCY 滚动、图块映射、背景调色板切换毛刺、DMA、STAT 中断 |
+| PPU | **逐 dot（T-cycle）状态机**：37 个主状态 + 19 个取数状态 + 双 FIFO，BG/Window/OBJ 三层，含 SCX/SCY 滚动、图块映射、背景调色板切换毛刺、逐周期 OAM DMA、STAT 中断 |
 | MBC | MBC1/MBC3/MBC5 换页 + SRAM 存档 + RTC 寄存器（.sav 落盘 / 网页 localStorage） |
 | APU | 4 通道（方波×2 + 波形 + 噪声）+ 帧序列器，WAV 输出 / 网页 Web Audio |
-| 验证 | Blargg CPU 指令考卷 **75/75** + Mooneye MBC1 **13/13** + MBC5 **8/8** + cargo test **56 项** + Mealybug Tearoom **24/24** |
+| 验证 | Blargg CPU 指令考卷 **75/75** + Mooneye MBC1 **13/13** + MBC5 **8/8** + cargo test **58 项** + Mooneye OAM DMA **6/6** + Mealybug Tearoom **24/24** |
 
 ## 怎么跑
 

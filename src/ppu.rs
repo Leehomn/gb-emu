@@ -108,6 +108,7 @@ struct ObjPixel {
 pub struct Ppu {
     pub framebuffer: [[u8; SCREEN_W]; SCREEN_H],
     pub ly: u8,
+    pub(crate) oam_dma_active: bool,
 
     lcdc: u8,
     last_lcdc: u8,
@@ -173,6 +174,7 @@ impl Ppu {
         Ppu {
             framebuffer: [[0; SCREEN_W]; SCREEN_H],
             ly: 0,
+            oam_dma_active: false,
             lcdc: 0,
             last_lcdc: 0,
             last_bgp: 0,
@@ -920,7 +922,7 @@ impl Ppu {
 
     // ---------- OAM 扫描 ----------
     fn handle_oam_scan_entry(&mut self, mem: &mut [u8]) {
-        if self.oam_scan_count < 10 {
+        if !self.oam_dma_active && self.oam_scan_count < 10 {
             let obj_height = if self.lcdc & 0x04 != 0 { 16 } else { 8 };
             let base = 0xFE00 + self.oam_scan_index as usize * 4;
             let entry_y = mem[base];

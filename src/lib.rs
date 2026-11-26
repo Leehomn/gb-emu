@@ -75,6 +75,23 @@ pub fn set_dbg_line(line: u8) { DBG_LINE.with(|l| l.set(line)); }
 //   · SRAM 存档（0xA000~0xBFFF）：卡带自带可写内存，纽扣电池供电，得先「开锁」才读写
 //   · 串口（0xFF01 数据 / 0xFF02 控制）：Blargg / Mooneye 考卷用它打印成绩单！
 //     往 FF02 写 0x81 = 「把 FF01 里的字符发出去」，我们把它收进字符串。
+const OAM_DMA_LEN: u16 = 0xA0;
+const OAM_DMA_REG: u16 = 0xFF46;
+const OAM_START: u16 = 0xFE00;
+const DOTS_PER_M_CYCLE: u32 = 4;
+
+struct OamDmaTransfer {
+    source: u16,
+    offset: u16,
+}
+
+#[derive(Default)]
+struct OamDma {
+    active: Option<OamDmaTransfer>,
+    start_cycles: u8,
+    dots: u32,
+}
+
 pub struct Bus {
     pub mem: Vec<u8>,
     pub cart: Vec<u8>,        // 完整卡带 ROM（含 MBC 换页的全部 bank）
@@ -103,6 +120,7 @@ pub struct Bus {
     pub apu_writes: Vec<(u16, u8)>,   // 诊断：游戏写过哪些 APU 寄存器（值）
     pub apu: Apu,             // 发声芯片（最小闭环版）
     pub ppu: Ppu,             // 显像芯片：逐 dot 推进，由本总线的每次 CPU 访存驱动（见 mcycle）
+    oam_dma: OamDma,
     mcycles: u32,             // 本条指令已走过的 M-cycle 数（每次 CPU 读/写 +1，指令末尾按它补齐内部周期）
 }
 // 卡带头 0x149 字节 → SRAM 大小（字节）
@@ -158,6 +176,7 @@ impl Bus {
             apu_writes: Vec::new(),
             apu: Apu::new(),
             ppu: Ppu::new(),
+            oam_dma: OamDma::default(),
             mcycles: 0,
         };
         b.mem[0xFF44] = 0x00;   // LY：现在由 PPU 真正驱动，不再谎报
@@ -165,10 +184,19 @@ impl Bus {
     }
     // CPU 读：先推进一个 M-cycle（4 dot），再在周期末尾读到最新状态（LY/STAT 等）
     pub fn read(&mut self, addr: u16) -> u8 {
+        let blocked = self.dma_blocks_cpu(addr);
         self.mcycle();
-        self.read_untimed(addr)
+        if blocked { 0xFF } else { self.read_untimed(addr) }
     }
-    // 不耗周期的读（DMA 搬运用；DMA 本身另有 160 M-cycle，这里保持瞬时完成）
+
+    fn dma_blocks_cpu(&self, addr: u16) -> bool {
+        // DMA 寄存器在搬运期间仍可读写。
+        self.oam_dma.active.is_some()
+            && addr != OAM_DMA_REG
+            && !(0xFF80..=0xFFFE).contains(&addr)
+    }
+
+    // DMA 使用同一套卡带和内存映射，读取本身不走 CPU 时钟或访问限制。
     fn read_untimed(&mut self, addr: u16) -> u8 {
         match addr {
             0x0000..=0x7FFF => self.read_rom(addr),
@@ -257,7 +285,9 @@ impl Bus {
         if TRACE.with(|t| t.get()) && matches!(addr, 0xFF40..=0xFF4B) {
             eprintln!("W {:04X}<={:02X} ly={} dot={} pc={:04X}", addr, val, self.ppu.ly, self.ppu.dots, TRACE_PC.with(|p| p.get()));
         }
-        self.write_untimed(addr, val);
+        if !self.dma_blocks_cpu(addr) {
+            self.write_untimed(addr, val);
+        }
         self.mcycle();
     }
     fn write_untimed(&mut self, addr: u16, val: u8) {
@@ -317,12 +347,13 @@ impl Bus {
             0xFF44 => { return; }                                          // LY 只读
             0xFF40 => { self.ppu.write_lcdc(val, &mut self.mem); return; }  // LCDC：写入 PPU 和可读寄存器
             0xFF41 => { self.ppu.write_stat(val, &mut self.mem); return; }  // STAT：DMG 写入延迟 1 dot，期间所有中断使能全开
-            0xFF46 => {                                                    // DMA：把 XX00~XX9F 搬到 OAM
-                let src = (val as u16) << 8;
-                for i in 0..0xA0u16 {
-                    let v = self.read_untimed(src + i);                      // 走 read_untimed 让 ROM 区也能正确取到卡带
-                    self.mem[0xFE00 + i as usize] = v;
+            OAM_DMA_REG => {
+                self.mem[OAM_DMA_REG as usize] = val;
+                // 写入所在周期和随后的等待周期结束后，新传输才开始。
+                if self.oam_dma.active.is_none() && self.oam_dma.start_cycles == 0 {
+                    self.oam_dma.dots = 0;
                 }
+                self.oam_dma.start_cycles = 2;
                 return;
             }
             _ => {}
@@ -349,8 +380,46 @@ impl Bus {
     }
     fn advance(&mut self, t: u32) {
         if t == 0 { return; }
-        self.ppu.tick_dots(t, &mut self.mem);
+        let mut remaining = t;
+        // 有 DMA 时逐机器周期交错推进，空闲时沿用 PPU 的批量推进。
+        while remaining > 0 && (self.oam_dma.start_cycles > 0 || self.oam_dma.active.is_some()) {
+            let dots = remaining.min(DOTS_PER_M_CYCLE - self.oam_dma.dots);
+            self.ppu.tick_dots(dots, &mut self.mem);
+            self.oam_dma.dots += dots;
+            remaining -= dots;
+            if self.oam_dma.dots == DOTS_PER_M_CYCLE {
+                self.oam_dma.dots = 0;
+                self.tick_oam_dma();
+            }
+        }
+        self.ppu.tick_dots(remaining, &mut self.mem);
         self.tick_periph(t);
+    }
+
+    fn tick_oam_dma(&mut self) {
+        if let Some(mut transfer) = self.oam_dma.active.take() {
+            let addr = transfer.source + transfer.offset;
+            self.mem[(OAM_START + transfer.offset) as usize] = self.read_untimed(addr);
+            transfer.offset += 1;
+            if transfer.offset < OAM_DMA_LEN {
+                self.oam_dma.active = Some(transfer);
+            }
+        }
+
+        // 重启的等待周期里，旧传输照常搬运。
+        if self.oam_dma.start_cycles > 0 {
+            self.oam_dma.start_cycles -= 1;
+            if self.oam_dma.start_cycles == 0 {
+                let page = self.mem[OAM_DMA_REG as usize];
+                // DMG 的高源页落在工作内存的镜像上。
+                let page = if page >= 0xE0 { page - 0x20 } else { page };
+                self.oam_dma.active = Some(OamDmaTransfer {
+                    source: u16::from(page) << 8,
+                    offset: 0,
+                });
+            }
+        }
+        self.ppu.oam_dma_active = self.oam_dma.active.is_some();
     }
     fn tick_periph(&mut self, t: u32) {
         self.apu.tick(t);
@@ -409,6 +478,8 @@ impl Bus {
         self.rtc_latched = [0; 5];
         self.rtc_latch_pre = false;
         self.rtc_last_wall = None;
+        self.oam_dma = OamDma::default();
+        self.ppu.oam_dma_active = false;
         self.apply_boot_state();
     }
     // DMG boot ROM 的收尾副作用（我们不跑 boot ROM，但 Mealybug 标准答案在带 boot 的模拟器上生成，
@@ -946,6 +1017,54 @@ impl Cpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oam_dma_copies_one_byte_per_machine_cycle_and_blocks_cpu() {
+        let mut bus = Bus::new();
+        for i in 0..160 {
+            bus.mem[0xC000 + i] = (i + 1) as u8;
+        }
+        bus.write(0xFF46, 0xC0);
+        assert_eq!(bus.mem[0xFE00], 0);
+        assert_eq!(bus.read(0xFE00), 0, "启动后的等待周期仍能读 OAM");
+        assert_eq!(bus.mem[0xFE00], 0);
+
+        bus.advance(2);
+        assert_eq!(bus.mem[0xFE00], 0);
+        bus.advance(2);
+        assert_eq!(&bus.mem[0xFE00..0xFE03], &[1, 0, 0]);
+
+        assert_eq!(bus.read(0xFE00), 0xFF);
+        assert_eq!(bus.read(0xFF46), 0xC0);
+        bus.write(0xC000, 0xEE);
+        assert_eq!(bus.mem[0xC000], 1);
+        bus.write(0xFF80, 0x42);
+        assert_eq!(bus.read(0xFF80), 0x42);
+
+        bus.advance(153 * 4);
+        assert_eq!(&bus.mem[0xFE9E..0xFEA0], &[159, 0]);
+        assert_eq!(bus.read(0xFE9F), 0xFF, "最后一个搬运周期仍禁止 CPU 读 OAM");
+        assert_eq!(bus.read(0xFE9F), 160);
+        assert_eq!(&bus.mem[0xFE00..0xFEA0], &bus.mem[0xC000..0xC0A0]);
+    }
+
+    #[test]
+    fn oam_dma_restart_keeps_copying_until_the_new_transfer_starts() {
+        let mut bus = Bus::new();
+        bus.mem[0xC000..0xC0A0].fill(0x12);
+        bus.mem[0xD000..0xD0A0].fill(0x34);
+        bus.write(0xFF46, 0xC0);
+        bus.advance(8);
+        assert_eq!(&bus.mem[0xFE00..0xFE04], &[0x12, 0, 0, 0]);
+
+        bus.write(0xFF46, 0xD0);
+        assert_eq!(bus.read(0xFE00), 0xFF);
+        assert_eq!(&bus.mem[0xFE00..0xFE04], &[0x12, 0x12, 0x12, 0]);
+        bus.advance(4);
+        assert_eq!(&bus.mem[0xFE00..0xFE04], &[0x34, 0x12, 0x12, 0]);
+        bus.advance(159 * 4);
+        assert_eq!(&bus.mem[0xFE00..0xFEA0], &[0x34; 160]);
+    }
 
     fn run(program: &[u8], steps: usize) -> (Cpu, Bus) {
         let mut bus = Bus::new();
