@@ -15,10 +15,10 @@
 | 中断 | VBlank / LCD / Timer / Serial / Joypad 五个向量，IME + IE/IF 逻辑 |
 | 定时器 | DIV + TIMA/TMA/TAC，按 TAC 分频累加、溢出回装 |
 | 串口 | 0xFF01/0xFF02，把测试 ROM 的 `ok` 结果吐到终端 |
-| PPU | 背景层（BG）+ Window + 精灵层（OBJ），含 SCX/SCY 滚动、图块映射、调色板、DMA、STAT 中断 |
+| PPU | **逐 dot（T-cycle）状态机**：37 个主状态 + 19 个取数状态 + 双 FIFO，BG/Window/OBJ 三层，含 SCX/SCY 滚动、图块映射、调色板 1-dot 延迟、DMA、STAT 中断 |
 | MBC | MBC1/MBC3/MBC5 换页 + SRAM 存档 + RTC 寄存器（.sav 落盘 / 网页 localStorage） |
 | APU | 4 通道（方波×2 + 波形 + 噪声）+ 帧序列器，WAV 输出 / 网页 Web Audio |
-| 验证 | Blargg CPU 指令考卷 **75/75 全过** + Mooneye MBC1 **13 卷** + MBC5 **8 卷全过** |
+| 验证 | Blargg CPU 指令考卷 **75/75** + Mooneye MBC1 **13/13** + MBC5 **8/8** + cargo test **55 项** + Mealybug Tearoom **12/24**（进行中） |
 
 ## 怎么跑
 
@@ -59,18 +59,44 @@ node verify_homebrew.js
 
 跑 500 万条指令后检查 PPU 是否画出内容。
 
+### Mealybug Tearoom Tests（PPU 时序考卷，进行中）
+
+24 张标准答案逐像素比对，当前 **12/24 通过**。
+
+```powershell
+# 前置：把测试 ROM 放进 _mealybug/extracted/、标准答案 PNG 放进 _mealybug/repo/expected/DMG-blob/
+# （这两处都被 .gitignore 挡着，需要自己从 https://github.com/mattcurrie/mealybug-tearoom-tests 取）
+
+# 一次跑全部 24 张
+python -X utf8 .\_mealybug\compare.py
+
+# 单张细看
+.\target\release\gb-emu.exe .\_mealybug\extracted\m3_scy_change.gb --mealybug .\_mealybug\out\m3_scy_change.raw
+python -X utf8 .\_mealybug\diff_rows.py m3_scy_change
+python -X utf8 .\_mealybug\ascii_diff.py m3_scy_change
+```
+
+这套测试比 Blargg 难得多：它专测「寄存器在一行渲染中途被改写」这类边界时序，需要 PPU 逐 dot 推进才能还原。旧版按扫描线整行渲染，一张都过不了。
+
 ## 目录结构
 
 ```
 gb-emu/
 ├── src/
-│   ├── main.rs       # CPU、总线、中断、定时器、串口、单元测试
-│   ├── ppu.rs        # 背景层 + 精灵层渲染
-│   └── apu.rs        # 音频（4 通道 + 帧序列器，WAV 输出）
+│   ├── lib.rs        # CPU（全指令集+CB）、总线、中断、定时器、串口、MBC、单元测试
+│   ├── ppu.rs        # PPU：逐 dot 状态机 + 双 FIFO + 取数器
+│   ├── apu.rs        # 音频（4 通道 + 帧序列器，WAV 输出）
+│   ├── main.rs       # CLI 入口（--screenshot / --play / --wav / --mealybug）
+│   └── wasm.rs       # C ABI 导出层（只在 wasm32 目标编译）
 ├── web/
-│   └── index.html    # 网页版（单文件，可玩 Adjustris / 2048 / 扫雷）
+│   └── index.html    # 网页版（单文件，可玩 5 款开源游戏）
+├── emulator/         # web/ 的副本，供展示站 iframe 载入
+├── index.html        # 作品展示站（RustBoy）
 ├── roms/             # 测试 ROM（Blargg 考卷等）
+├── roms_mbc/         # Mooneye MBC1 考卷
+├── roms_mbc5/        # Mooneye MBC5 考卷
 ├── roms_homebrew/    # 内置开源游戏 ROM（见「关于 ROM」）
+├── _mealybug/        # Mealybug 攻坚台（脚本入库，ROM/标准答案/参照实现不入库）
 ├── verify_homebrew.js# 网页版无头验证脚本
 └── assets/img/       # 成果截图（exam.png / screen2048.png / screenminesweep.png）
 ```
@@ -98,6 +124,7 @@ CHIP-8（35 条指令，Python）
   → MBC3/MBC5 换页 + RTC 寄存器（Mooneye MBC5 8 卷全过）
   → APU 音频（4 通道 + 帧序列器）
   → 网页版跑开源游戏（Adjustris / 2048 / 扫雷），能玩有声
+  → PPU 逐 dot 重写（Mealybug 时序考卷，进行中 12/24）
 ```
 
 ## 里程碑
@@ -109,3 +136,4 @@ CHIP-8（35 条指令，Python）
 - [x] ⑤ 音频（APU 4 通道 + 帧序列器）
 - [x] ⑥ MBC1 换页 + SRAM 存档（Mooneye 13 卷全过）
 - [x] ⑦ MBC3/MBC5 换页 + RTC 寄存器（Mooneye MBC5 8 卷全过）
+- [ ] ⑧ PPU 逐 dot 时序：Mealybug Tearoom **12/24**（剩余 12 张见 `_mealybug/compare.py` 输出）

@@ -3,3 +3,18 @@
 *.gb
 play_*.txt
 *.wav
+
+# Mealybug 攻坚工作台：只留脚本，挡掉大件与第三方参照实现
+# probe.bin 61MB / docboy_tree.json 7MB / repo 61.85MB 都是本地临时物
+_mealybug/out/
+_mealybug/extracted/
+_mealybug/repo/
+_mealybug/probe.bin
+_mealybug/docboy_tree.json
+_mealybug/mealybug.zip
+_mealybug/*.cpp
+_mealybug/*.c
+_mealybug/*.h
+_mealybug/*.log
+_mealybug/*.bin
+_mealybug/*.json
