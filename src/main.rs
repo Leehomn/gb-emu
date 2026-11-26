@@ -2,7 +2,7 @@
 // 核心逻辑都在 src/lib.rs（crate 名 gb_emu），本文件只保留命令行入口 + 实时窗口。
 // 运行：cargo run --release -- roms/<游戏>.gb [--screenshot out.ppm | --play | --wav out.wav | --tone]
 
-use gb_emu::{apu, ppu, Apu, Bus, Cpu, Ppu};
+use gb_emu::{apu, ppu, Apu, Bus, Cpu};
 fn main() {
     // 带参数 = 跑考卷：cargo run --release -- roms/cpu_instrs.gb [--screenshot out.ppm]
     // --play = 实时窗口玩：cargo run --release -- roms/<游戏>.gb --play
@@ -32,7 +32,6 @@ fn main() {
         let mut bus = Bus::new();
         bus.load_rom(&rom);
         let mut cpu = Cpu::new();
-        let mut ppu = Ppu::new();
         let screenshot = args.iter().position(|a| a == "--screenshot").map(|i| args[i + 1].clone());
         let wav_out = args.iter().position(|a| a == "--wav").map(|i| args[i + 1].clone());
         let frames_limit: u64 = if screenshot.is_some() { u64::MAX } else { u64::MAX };
@@ -58,10 +57,9 @@ fn main() {
                     _ => bus.joypad_dir &= !0x04,   // 上
                 }
             }
-            let t = cpu.step(&mut bus);
-            ppu.tick(t, &mut bus);
-            if ppu.ly == 0 && prev_ly != 0 { frames += 1; }   // 行号回绕 = 一帧过完
-            prev_ly = ppu.ly;
+            cpu.step(&mut bus);                                   // PPU 内嵌在 Bus 里，随 CPU 访存逐 M-cycle 推进
+            if bus.ppu.ly == 0 && prev_ly != 0 { frames += 1; }   // 行号回绕 = 一帧过完
+            prev_ly = bus.ppu.ly;
             if _i % 5_000_000 == 0 && _i > 0 {
                 if bus.serial_out.len() == last_len { stuck += 1; } else { stuck = 0; }
                 last_len = bus.serial_out.len();
@@ -82,8 +80,7 @@ fn main() {
                 let mut s = 0;
                 let mut last = bus.serial_out.len();
                 for i in 0..600_000_000u64 {
-                    let t = cpu.step(&mut bus);
-                    ppu.tick(t, &mut bus);
+                    cpu.step(&mut bus);
                     if i % 5_000_000 == 0 && i > 0 {
                         if bus.serial_out.len() == last { s += 1; } else { s = 0; }
                         last = bus.serial_out.len();
@@ -91,7 +88,7 @@ fn main() {
                     }
                 }
             }
-            save_ppm(&path, &ppu.framebuffer);
+            save_ppm(&path, &bus.ppu.framebuffer);
             println!("截图已存：{}", path);
         }
         if let Some(path) = wav_out {
@@ -150,7 +147,6 @@ fn play(rom_path: &str) {
     let mut bus = Bus::new();
     bus.load_rom(&rom);
     let mut cpu = Cpu::new();
-    let mut ppu = Ppu::new();
 
     let scale = 4;
     let (w, h) = (ppu::SCREEN_W * scale, ppu::SCREEN_H * scale);
@@ -195,15 +191,13 @@ fn play(rom_path: &str) {
         // 跑一帧：70224 周期
         let mut spent = 0u32;
         while spent < 70224 {
-            let t = cpu.step(&mut bus);
-            ppu.tick(t, &mut bus);
-            spent += t;
+            spent += cpu.step(&mut bus);   // PPU 内嵌在 Bus 里
         }
 
         // 涂色上屏
         for y in 0..ppu::SCREEN_H {
             for x in 0..ppu::SCREEN_W {
-                let c = palette[ppu.framebuffer[y][x] as usize];
+                let c = palette[bus.ppu.framebuffer[y][x] as usize];
                 for sy in 0..scale {
                     for sx in 0..scale {
                         pixels[(y * scale + sy) * w + x * scale + sx] = c;

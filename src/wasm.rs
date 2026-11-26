@@ -9,7 +9,7 @@
 //!   · 屏幕帧 / SRAM / 音频样本都是 Emu 的固定字段或 Vec，接口按「先取指针读，读完立刻
 //!     不再依赖它」的节奏走，绝不在两次调用之间跨 grow 持视图。
 
-use crate::{ppu, Bus, Cpu, Ppu};
+use crate::{ppu, Bus, Cpu};
 
 // 一帧 = 456 周期/线 × 154 线（真机节奏，59.7 fps）
 const FRAME_CYCLES: u32 = 70224;
@@ -19,7 +19,6 @@ const SCREEN_LEN: usize = ppu::SCREEN_W * ppu::SCREEN_H;
 pub struct Emu {
     bus: Bus,
     cpu: Cpu,
-    ppu: Ppu,
     screen: [u8; SCREEN_LEN],
 }
 
@@ -48,7 +47,6 @@ pub extern "C" fn gb_new() -> *mut Emu {
     Box::into_raw(Box::new(Emu {
         bus: Bus::new(),
         cpu: Cpu::new(),
-        ppu: Ppu::new(),
         screen: [0; SCREEN_LEN],
     }))
 }
@@ -70,13 +68,11 @@ pub extern "C" fn gb_run_frame(ptr: *mut Emu) {
         let emu = &mut *ptr;
         let mut spent = 0u32;
         while spent < FRAME_CYCLES {
-            let t = emu.cpu.step(&mut emu.bus);
-            emu.ppu.tick(t, &mut emu.bus);
-            spent += t;
+            spent += emu.cpu.step(&mut emu.bus);   // PPU 内嵌在 Bus 里，随访存逐 M-cycle 推进
         }
         for y in 0..ppu::SCREEN_H {
             for x in 0..ppu::SCREEN_W {
-                emu.screen[y * ppu::SCREEN_W + x] = emu.ppu.framebuffer[y][x];
+                emu.screen[y * ppu::SCREEN_W + x] = emu.bus.ppu.framebuffer[y][x];
             }
         }
     }

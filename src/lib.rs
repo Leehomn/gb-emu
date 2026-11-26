@@ -60,6 +60,15 @@ impl Registers {
     }
 }
 
+// 调试：设 GB_TRACE=1 时打印 PPU 寄存器写入时刻（LY/dot/PC），用于和 Mealybug 标准答案对时序
+thread_local! {
+    static TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TRACE_PC: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+    static DBG_LINE: std::cell::Cell<u8> = const { std::cell::Cell::new(255) };
+}
+pub fn set_trace(on: bool) { TRACE.with(|t| t.set(on)); }
+pub fn set_dbg_line(line: u8) { DBG_LINE.with(|l| l.set(line)); }
+
 // ---------- 64KB 总线 ----------
 // 真机上不同地址段通向不同硬件。本批接三样：
 //   · 卡带 ROM（0x0000~0x7FFF）：经 MBC 芯片换页（bank 切进 0x4000~0x7FFF 窗口）
@@ -93,6 +102,8 @@ pub struct Bus {
     pub joy_log: Vec<(u64, u8, u8)>,  // 诊断：(第几次读, 选择位, 返回值) 最近几次
     pub apu_writes: Vec<(u16, u8)>,   // 诊断：游戏写过哪些 APU 寄存器（值）
     pub apu: Apu,             // 发声芯片（最小闭环版）
+    pub ppu: Ppu,             // 显像芯片：逐 dot 推进，由本总线的每次 CPU 访存驱动（见 mcycle）
+    mcycles: u32,             // 本条指令已走过的 M-cycle 数（每次 CPU 读/写 +1，指令末尾按它补齐内部周期）
 }
 // 卡带头 0x149 字节 → SRAM 大小（字节）
 fn ram_size_for(header: &[u8]) -> usize {
@@ -146,11 +157,19 @@ impl Bus {
             joypad_dir: 0x0F, joypad_btn: 0x0F, joy_reads: 0, joy_log: Vec::new(),
             apu_writes: Vec::new(),
             apu: Apu::new(),
+            ppu: Ppu::new(),
+            mcycles: 0,
         };
         b.mem[0xFF44] = 0x00;   // LY：现在由 PPU 真正驱动，不再谎报
         b
     }
+    // CPU 读：先推进一个 M-cycle（4 dot），再在周期末尾读到最新状态（LY/STAT 等）
     pub fn read(&mut self, addr: u16) -> u8 {
+        self.mcycle();
+        self.read_untimed(addr)
+    }
+    // 不耗周期的读（DMA 搬运用；DMA 本身另有 160 M-cycle，这里保持瞬时完成）
+    fn read_untimed(&mut self, addr: u16) -> u8 {
         match addr {
             0x0000..=0x7FFF => self.read_rom(addr),
             0xA000..=0xBFFF => self.read_ram(addr),
@@ -232,7 +251,16 @@ impl Bus {
             self.ram[idx] = val;
         }
     }
+    // CPU 写：写入 M-cycle 的第 1 个 dot 就生效（真机上寄存器在整个写周期都能看到新值），
+    // 所以先写、再把这 4 个 dot 走完。
     pub fn write(&mut self, addr: u16, val: u8) {
+        if TRACE.with(|t| t.get()) && matches!(addr, 0xFF40..=0xFF4B) {
+            eprintln!("W {:04X}<={:02X} ly={} dot={} pc={:04X}", addr, val, self.ppu.ly, self.ppu.dots, TRACE_PC.with(|p| p.get()));
+        }
+        self.write_untimed(addr, val);
+        self.mcycle();
+    }
+    fn write_untimed(&mut self, addr: u16, val: u8) {
         // 卡带区写入 = MBC 命令（不是真往 ROM 写，是给换页芯片下指令）
         let is_mbc1 = matches!(self.mbc_type, 0x01 | 0x02 | 0x03);
         let is_mbc3 = self.is_mbc3();
@@ -287,11 +315,13 @@ impl Bus {
             0xFF07 => { self.tac = val & 7; self.mem[0xFF07] = val; return; }
             0xFF0F => { self.mem[0xFF0F] = val & 0x1F; return; }           // IF 低5位
             0xFF44 => { return; }                                          // LY 只读
-            0xFF41 => { self.mem[0xFF41] = (self.mem[0xFF41] & 0x07) | (val & 0xF8); return; }  // STAT：bit0-2只读，游戏只能写bit3-6使能位
+            0xFF40 => { self.ppu.write_lcdc(val, &mut self.mem); return; }  // LCDC：开关机即时生效，其余位由 PPU 内部副本延迟 1 dot 使用
+            0xFF41 => { self.ppu.write_stat(val, &mut self.mem); return; }  // STAT：DMG 写入延迟 1 dot，期间所有中断使能全开
+            0xFF48 | 0xFF49 => { self.ppu.write_obp(addr, val, &mut self.mem); return; }  // OBP0/OBP1：DMG 写入延迟 1 dot（m3_obp0_change）
             0xFF46 => {                                                    // DMA：把 XX00~XX9F 搬到 OAM
                 let src = (val as u16) << 8;
                 for i in 0..0xA0u16 {
-                    let v = self.read(src + i);                            // 走 read() 让 ROM 区也能正确取到卡带
+                    let v = self.read_untimed(src + i);                      // 走 read_untimed 让 ROM 区也能正确取到卡带
                     self.mem[0xFE00 + i as usize] = v;
                 }
                 return;
@@ -307,7 +337,23 @@ impl Bus {
         }
     }
     // 每走 t 个周期调一次：DIV/TIMA 按真实时间走（你 CHIP-8 批次④的教训！）
+    // 指令内部已经通过访存推进过的 M-cycle 要扣掉，只补齐剩下的内部周期。
     pub fn tick(&mut self, t: u32) {
+        let used = 4 * self.mcycles;
+        self.mcycles = 0;
+        self.advance(t.saturating_sub(used));
+    }
+    // 一个 M-cycle：PPU 走 4 个 dot + 定时器/音频走 4 周期
+    fn mcycle(&mut self) {
+        self.mcycles += 1;
+        self.advance(4);
+    }
+    fn advance(&mut self, t: u32) {
+        if t == 0 { return; }
+        self.ppu.tick_dots(t, &mut self.mem);
+        self.tick_periph(t);
+    }
+    fn tick_periph(&mut self, t: u32) {
         self.apu.tick(t);
         // DIV：每 256 周期 +1
         self.div_acc += t;
@@ -364,6 +410,48 @@ impl Bus {
         self.rtc_latched = [0; 5];
         self.rtc_latch_pre = false;
         self.rtc_last_wall = None;
+        self.apply_boot_state();
+    }
+    // DMG boot ROM 的收尾副作用（我们不跑 boot ROM，但 Mealybug 标准答案在带 boot 的模拟器上生成，
+    // 多张测试用 tile $19 = 「®」图块）：boot ROM 会把卡带头 $0104~$0133 的任天堂 logo 逐字节位加倍
+    // 后写进 VRAM $8010 起（每字节 8 字节：同一行重复 4 次，高位平面为 0），再在 $8190 写「®」图块，
+    // 并铺 logo 的地图案、设 BGP=$FC / LCDC=$91。
+    fn apply_boot_state(&mut self) {
+        for i in 0..48usize {
+            let b = self.cart.get(0x104 + i).copied().unwrap_or(0);
+            let mut d: u8 = 0;
+            for bit in (0..8).rev() {
+                let bit = (b >> bit) & 1;
+                d = (d << 2) | (bit << 1) | bit;
+            }
+            let base = 0x8010 + i * 8;
+            for off in [0, 2, 4, 6] {
+                self.mem[base + off] = d;
+            }
+        }
+        for (r, &v) in [0x3Cu8, 0x42, 0xB9, 0xA5, 0xB9, 0xA5, 0x42, 0x3C].iter().enumerate() {
+            self.mem[0x8190 + r * 2] = v;
+        }
+        // 地图案：$9910=$19；$992F 下行到 $9924 写 $18..$0D；$980F 下行到 $9804 写 $0C..$01
+        self.mem[0x9910] = 0x19;
+        let mut a = 0x18u8;
+        let mut addr = 0x992Fu16;
+        while a >= 0x0D {
+            self.mem[addr as usize] = a;
+            addr -= 1;
+            a -= 1;
+        }
+        a = 0x0C;
+        addr = 0x980F;
+        while a >= 0x01 {
+            self.mem[addr as usize] = a;
+            addr -= 1;
+            a -= 1;
+        }
+        self.mem[0xFF47] = 0xFC;
+        self.ppu.write_lcdc(0x91, &mut self.mem);
+        self.mem[0xFF42] = 0;
+        self.mem[0xFF43] = 0;
     }
     // 把 SRAM 存档落盘为 .sav 文件（测试后调用验证持久化）
     pub fn save_sram(&self, path: &str) -> std::io::Result<()> {
@@ -382,7 +470,8 @@ pub struct Cpu {
     pub pc: u16,
     pub sp: u16,          // 栈指针：新抽屉！指向「下一个空位」
     pub halted: bool,
-    pub ime: bool,        // 中断总开关（EI/DI 改它，中断本身下批做）
+    pub ime: bool,        // 中断总开关（EI 的效果延迟到下一条指令之后才生效，见 ei_pending）
+    ei_pending: u8,       // EI 延迟计数：EI 后第 2 条指令结束才打开 IME（真机行为）
     pub cycles: u64,
     pub unknown: Vec<(u8, u16)>,   // 未实现指令记录（去重），考完对答案用
     pub mooneye_result: Option<u8>,  // Mooneye 测试结果：执行 0x40(magic_breakpoint) 时 B=3 过 / 0x42 挂
@@ -390,10 +479,11 @@ pub struct Cpu {
 
 impl Cpu {
     pub fn new() -> Self {
-        Cpu { reg: Registers::new(), pc: 0x0100, sp: 0xFFFE, halted: false, ime: false, cycles: 0, unknown: Vec::new(), mooneye_result: None }
+        Cpu { reg: Registers::new(), pc: 0x0100, sp: 0xFFFE, halted: false, ime: false, ei_pending: 0, cycles: 0, unknown: Vec::new(), mooneye_result: None }
     }
 
     fn fetch8(&mut self, bus: &mut Bus) -> u8 {
+        TRACE_PC.with(|p| p.set(self.pc));
         let v = bus.read(self.pc);
         self.pc = self.pc.wrapping_add(1);
         v
@@ -549,16 +639,16 @@ impl Cpu {
     // IE(FFFF) 和 IF(FF0F) 按位与：哪位都亮 = 哪个中断在敲门。
     // 受理：ime 关掉 → PC 压栈（你的 CALL！）→ 跳到固定向量地址。
     // 向量表：VBlank=0040 LCD=0048 Timer=0050 Serial=0058 Joypad=0060
+    // 这里的查表不耗周期（真机在指令最后一个 M-cycle 里顺手查），派发本身 20 周期由调用方 tick。
     fn check_interrupts(&mut self, bus: &mut Bus) -> u32 {
-        let pending = bus.read(0xFFFF) & bus.read(0xFF0F) & 0x1F;
+        let pending = bus.mem[0xFFFF] & bus.mem[0xFF0F] & 0x1F;
         if pending == 0 { return 0; }
         if self.halted { self.halted = false; }   // 有中断敲门就醒（哪怕 ime=0）
         if !self.ime { return 0; }
         for bit in 0..5u8 {
             if pending & (1 << bit) != 0 {
                 self.ime = false;                              // 进门随手关门
-                let ifv = bus.read(0xFF0F);
-                bus.write(0xFF0F, ifv & !(1 << bit));          // 门铃消音
+                bus.write(0xFF0F, bus.mem[0xFF0F] & !(1 << bit));   // 门铃消音
                 let ret = self.pc;
                 self.push(bus, ret);                           // 返程地址压栈
                 self.pc = 0x0040 + (bit as u16) * 8;           // 跳向量
@@ -575,6 +665,7 @@ impl Cpu {
             bus.tick(4);
             self.cycles += 4;
             let t = self.check_interrupts(bus);
+            bus.tick(t);
             self.cycles += t as u64;
             return 4 + t;
         }
@@ -588,8 +679,8 @@ impl Cpu {
             0x00 => 4,                                       // NOP
             0x10 => { let _ = self.fetch8(bus); 4 }          // STOP：考卷用它在失败处刹车，先当2字节NOP
             0x76 => { self.halted = true; 4 }                // HALT
-            0xF3 => { self.ime = false; 4 }                  // DI
-            0xFB => { self.ime = true; 4 }                   // EI
+            0xF3 => { self.ime = false; self.ei_pending = 0; 4 }           // DI
+            0xFB => { self.ei_pending = 2; 4 }                // EI：下一条指令结束后才真正打开
 
             // --- LD rr, nn（16位装载，31 是 SP）---
             0x01 => { let v = self.fetch16(bus); self.reg.set_bc(v); 12 }
@@ -752,6 +843,8 @@ impl Cpu {
                 let a = self.fetch16(bus);
                 if self.cond((op >> 3) & 3) { self.pc = a; 16 } else { 12 }
             }
+            // JP nn：16 周期（取指+2 字节+1 空转）。配合 PPU 在 dot 452 拉起 mode 2 STAT 中断、
+            // CPU 在 dot 456（=新行 dot 0）派发，处理函数起点落在 dot 36，与标准答案一致。
             0xC3 => { self.pc = self.fetch16(bus); 16 }       // JP nn
             0xE9 => { self.pc = self.reg.hl(); 4 }            // JP (HL)：跳到指针处
             0xC4|0xCC|0xD4|0xDC => {  // CALL cc, nn
@@ -841,8 +934,10 @@ impl Cpu {
             }
         };
         self.cycles += t as u64;
-        bus.tick(t);                          // 硬件时钟跟着指令走
+        bus.tick(t);                          // 硬件时钟跟着指令走（扣除已走过的 M-cycle）
+        if self.ei_pending > 0 { self.ei_pending -= 1; if self.ei_pending == 0 { self.ime = true; } }   // EI 的效果在下一指令末尾生效
         let it = self.check_interrupts(bus);  // 指令间隙查中断
+        bus.tick(it);
         self.cycles += it as u64;
         t + it
     }
@@ -1144,10 +1239,8 @@ mod tests {
         let mut bus = Bus::new();
         bus.load_rom(&rom);
         let mut cpu = Cpu::new();
-        let mut ppu = Ppu::new();
         for _ in 0..50_000_000u64 {
-            let t = cpu.step(&mut bus);
-            ppu.tick(t, &mut bus);
+            let _ = cpu.step(&mut bus);   // PPU 已内嵌在 Bus 里，随 CPU 访存逐 M-cycle 推进
             if cpu.mooneye_result.is_some() { break; }
         }
         cpu.mooneye_result
