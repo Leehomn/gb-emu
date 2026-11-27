@@ -1,6 +1,7 @@
 # gb-emu —— 从零手写的 Game Boy 模拟器
 
 > **在线试玩（作品展示站）**：<https://leehomn.github.io/gb-emu/>
+> **Game Boy Advance**：[GBA 核心与验证记录](./gba-cpu/README.md)
 > **项目复盘（为什么这么走、踩了哪些坑）**：见 [POSTMORTEM.md](./POSTMORTEM.md)
 
 一个用 Rust 写的 Game Boy（DMG）模拟器核心，配套一个纯 JS 的网页版，能跑 Adjustris、2048、扫雷等开源游戏。

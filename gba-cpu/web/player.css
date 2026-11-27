@@ -1,0 +1,52 @@
+:root {
+  font-family: system-ui, "Microsoft YaHei", sans-serif;
+  color: #142435;
+  background: #edf2f5;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+main {
+  width: min(1040px, 100% - 32px);
+  margin: 44px auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 300px);
+  gap: 20px;
+}
+header { grid-column: 1 / -1; }
+h1 { margin: 0; font-size: clamp(26px, 5vw, 42px); }
+h2 { margin: 0 0 14px; font-size: 17px; }
+p { margin: 8px 0 0; color: #4b5f72; overflow-wrap: anywhere; }
+.game, aside { border: 1px solid #cedae3; border-radius: 14px; padding: 20px; }
+.game { background: #203244; }
+aside { background: #fff; align-self: start; line-height: 1.55; }
+aside label { display: block; margin-bottom: 8px; }
+aside input { max-width: 100%; }
+aside p { margin: 12px 0 25px; }
+canvas { width: 100%; height: auto; display: block; background: #101b27; image-rendering: pixelated; border-radius: 6px; }
+.actions, .save { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+button {
+  padding: 9px 12px;
+  min-height: 40px;
+  border: 1px solid #bbcad7;
+  border-radius: 7px;
+  background: #fff;
+  color: #142435;
+  font: inherit;
+  cursor: pointer;
+}
+button:disabled { opacity: .55; cursor: default; }
+button:focus-visible, canvas:focus-visible { outline: 3px solid #007fa3; outline-offset: 2px; }
+#open { background: #a6e8da; border-color: #a6e8da; font-weight: 650; }
+dl { margin: 0; }
+dl div { display: flex; justify-content: space-between; gap: 10px; border-top: 1px solid #dee7ed; padding: 8px 0; }
+dd { margin: 0; text-align: right; }
+.controls { display: none; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; margin-top: 12px; }
+.controls button { touch-action: none; user-select: none; padding: 6px 2px; }
+.controls button:active { background: #a6e8da; }
+@media (max-width: 720px) {
+  main { margin: 24px auto; grid-template-columns: minmax(0, 1fr); }
+  .game, aside { padding: 12px; }
+}
+@media (pointer: coarse), (max-width: 720px) {
+  .controls { display: grid; }
+}

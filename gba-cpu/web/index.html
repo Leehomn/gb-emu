@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./player.css">
+  <script type="module" src="./player.js"></script>
+  <title>GBA 播放器</title>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>GBA 播放器</h1>
+      <p id="status" role="status">正在加载模拟器……</p>
+    </header>
+    <section class="game" aria-label="游戏">
+      <canvas id="screen" width="240" height="160" tabindex="0" aria-label="GBA 游戏画面"></canvas>
+      <div class="actions">
+        <button id="open" type="button" disabled>选择卡带</button>
+        <input id="rom" type="file" accept=".gba,.bin" hidden>
+        <button id="pause" disabled>暂停</button>
+        <button id="sound" aria-pressed="false" disabled>开启声音</button>
+      </div>
+      <div class="controls" aria-label="触屏按键">
+        <button data-key="9" aria-label="L 肩键">L</button>
+        <button data-key="8" aria-label="R 肩键">R</button>
+        <button data-key="6" aria-label="上">↑</button>
+        <button data-key="7" aria-label="下">↓</button>
+        <button data-key="5" aria-label="左">←</button>
+        <button data-key="4" aria-label="右">→</button>
+        <button data-key="1">B</button>
+        <button data-key="0">A</button>
+        <button data-key="2">Select</button>
+        <button data-key="3">Start</button>
+      </div>
+    </section>
+    <aside>
+      <h2>卡带设置</h2>
+      <label for="bios">BIOS（可选，下次载入卡带时使用）</label>
+      <input id="bios" type="file" accept=".bin">
+      <div class="save">
+        <button id="import" disabled>导入存档</button>
+        <input id="save-file" type="file" accept=".sav,.bin" hidden>
+        <button id="export" disabled>导出存档</button>
+      </div>
+      <p id="save-status" role="status">存档保留在当前浏览器。</p>
+      <h2>键盘操作</h2>
+      <dl>
+        <div><dt>方向</dt><dd>方向键</dd></div>
+        <div><dt>A / B</dt><dd>Z / X</dd></div>
+        <div><dt>L / R</dt><dd>A / S</dd></div>
+        <div><dt>Start / Select</dt><dd>回车 / 右 Shift</dd></div>
+      </dl>
+    </aside>
+  </main>
+</body>
+</html>
