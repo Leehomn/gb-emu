@@ -14,6 +14,135 @@ const PRESCALERS: [u16; 4] = [1, 64, 256, 1024];
 const IRQ_DELAY: u8 = 7;
 const DMA_START_DELAY: u64 = 2;
 const DMA_FINISH_DELAY: u32 = 2;
+const SPRITE_START: u16 = 40;
+const DISPLAY_LATCH_DOT: u16 = 40;
+const FIRST_PALETTE_FETCH: u16 = 47;
+const SPRITE_SHORT_BUDGET: u16 = 964;
+
+#[derive(Clone, Copy, Default)]
+struct SpriteFetch {
+    index: usize,
+    words_left: u8,
+    pause: u16,
+    read_next_attribute: bool,
+    target_line: Option<u16>,
+    budget: u16,
+    pending: SpritePixels,
+    pending_matrix: [i32; 4],
+    matrix_base: usize,
+    drawing: SpritePixels,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SpritePixels {
+    remaining: u16,
+    width: i32,
+    height: i32,
+    affine: bool,
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32,
+    tile: u16,
+}
+
+impl SpriteFetch {
+    fn start(&mut self, line: u16, display: u16) {
+        let next = (line + 1) % FRAME_LINES;
+        *self = Self {
+            target_line: (next < VISIBLE_LINES).then_some(next),
+            budget: if display & 0x20 != 0 { SPRITE_SHORT_BUDGET } else { LINE_CYCLES },
+            ..Self::default()
+        };
+    }
+
+    fn step(&mut self, display: u16, oam: &[u8; 1024], mosaic: u16, dot: u16) -> (bool, bool) {
+        if dot % 2 != 0 { return (false, false); }
+        let Some(row) = self.target_line else { return (false, false); };
+        let elapsed = (dot + LINE_CYCLES - SPRITE_START) % LINE_CYCLES;
+        // 强制空白抑制画面输出，精灵启用位单独控制精灵引擎。
+        if elapsed >= self.budget || display & 0x1000 == 0 {
+            return (false, false);
+        }
+
+        let pixels = &mut self.drawing;
+        let mut vram = false;
+        if pixels.remaining > 0 && !(pixels.affine && self.read_next_attribute) {
+            vram = (!pixels.affine || ((0..pixels.width).contains(&(pixels.x >> 8))
+                && (0..pixels.height).contains(&(pixels.y >> 8))))
+                && ((display & 7) < 3 || pixels.tile >= 512);
+            pixels.x += pixels.dx;
+            pixels.y += pixels.dy;
+            pixels.remaining -= 1;
+        }
+
+        // 取下一项的前两个属性可以与上一项的像素读取重叠。
+        if self.pause > 0 && !self.read_next_attribute {
+            self.pause -= 1;
+            return (false, vram);
+        }
+        self.read_next_attribute = false;
+        if self.index >= 128 { return (false, vram); }
+        let entry = &oam[self.index * 8..][..8];
+        let attr = |i: usize| u16::from_le_bytes([entry[i], entry[i + 1]]);
+        if self.words_left != 0 {
+            if self.words_left == if self.pending.affine { 5 } else { 1 } {
+                self.pending.tile = attr(4) & 1023;
+            } else {
+                let component = usize::from(4 - self.words_left);
+                let offset = self.matrix_base + component * 8;
+                self.pending_matrix[component] = i32::from(i16::from_le_bytes([
+                    oam[offset], oam[offset + 1],
+                ]));
+            }
+            self.words_left -= 1;
+            if self.words_left == 0 {
+                let mut pixels = self.pending;
+                if pixels.affine {
+                    let [pa, pb, pc, pd] = self.pending_matrix;
+                    let (x, y) = (pixels.x, pixels.y);
+                    pixels.x = pa * x + pb * y + (pixels.width << 7);
+                    pixels.y = pc * x + pd * y + (pixels.height << 7);
+                    pixels.dx = pa;
+                    pixels.dy = pc;
+                }
+                self.pause = pixels.remaining.saturating_sub(if pixels.affine { 1 } else { 2 });
+                self.drawing = pixels;
+                self.index += 1;
+                self.read_next_attribute = true;
+            }
+            return (true, vram);
+        }
+
+        let (a0, a1) = (attr(0), attr(2));
+        self.index += 1;
+        if a0 & 0x0300 == 0x0200 || a0 & 0x0C00 == 0x0C00 { return (true, vram); }
+        let Some((width, height)) = Bus::sprite_size(a0, a1) else { return (true, vram); };
+        let affine = a0 & 0x0100 != 0;
+        let scale = if a0 & 0x0200 != 0 { 2 } else { 1 };
+        let local_y = i32::from(row.wrapping_sub(a0 & 255) & 255);
+        if local_y >= height * scale { return (true, vram); }
+        let x = i32::from(a1 & 511);
+        let clip = if x >= 240 { (512 - x) & if affine { !0 } else { !1 } } else { 0 };
+        let visible = width * scale - clip;
+        if visible <= 0 { return (true, vram); }
+        let mut pixels = SpritePixels { width, height, affine, ..SpritePixels::default() };
+        if affine {
+            pixels.x = clip - width * scale / 2;
+            let mosaic_height = i32::from(mosaic >> 12) + 1;
+            let sample_row = if a0 & 0x1000 != 0 && a0 & 0x0C00 != 0x0800 {
+                (local_y - i32::from(row) % mosaic_height).max(0)
+            } else { local_y };
+            pixels.y = sample_row - height * scale / 2;
+            self.matrix_base = usize::from((a1 >> 9) & 31) * 32 + 6;
+        }
+        pixels.remaining = if affine { visible } else { visible / 2 } as u16;
+        self.pending = pixels;
+        self.words_left = if affine { 5 } else { 1 };
+        self.index -= 1;
+        (true, vram)
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 pub(crate) enum PowerMode {
@@ -74,6 +203,8 @@ struct DmaUnit {
 #[derive(Default)]
 pub(crate) struct Hardware {
     line: u16,
+    sprites: SpriteFetch,
+    display_latch: [u16; 3],
     pub(crate) frame: u64,
     dot: u16,
     display_irq: u16,
@@ -103,6 +234,15 @@ pub(crate) struct Hardware {
 }
 
 impl Hardware {
+    pub(crate) fn initialize_display_latch(&mut self, value: u16) {
+        if self.clock == 0 { self.display_latch.fill(value); }
+    }
+
+    pub(crate) fn latched_display_control(&self, current: u16, layers: u16) -> u16 {
+        let latched = self.display_latch[0];
+        // 开启图层需同时匹配当前值与锁存值，任一强制空白位都会屏蔽输出。
+        (current & !layers) | (current & latched & layers) | (latched & 0x0080)
+    }
     pub(crate) fn background_vram_cycles(&self, halfwords: u16, fetch_slots: u8) -> u32 {
         if self.line >= VISIBLE_LINES { return u32::from(halfwords); }
         let mut dot = self.dot + 1;
@@ -401,6 +541,45 @@ impl Hardware {
 }
 
 impl Bus {
+    pub(crate) fn palette_access_cycles(&self, units: u16) -> u32 {
+        if self.hw.line >= VISIBLE_LINES { return u32::from(units); }
+        let display = self.hw.latched_display_control(self.display_control, 0x1F00);
+        let mut dot = self.hw.dot + 1;
+        for _ in 0..units {
+            if (FIRST_PALETTE_FETCH..HBLANK_START).contains(&dot) {
+                let phase = (dot - FIRST_PALETTE_FETCH) % 4;
+                if matches!(phase, 0 | 2) {
+                    let column = usize::from((dot - FIRST_PALETTE_FETCH) / 4);
+                    if self.palette_fetches_pixel(self.hw.line.into(), column, phase == 2, display) {
+                        dot += 1;
+                    }
+                }
+            }
+            dot += 1;
+        }
+        u32::from(dot - self.hw.dot - 1)
+    }
+
+    pub(crate) fn sprite_access_cycles(&self, units: u16, oam: bool) -> u32 {
+        let mut sprites = self.hw.sprites;
+        let mut dot = self.hw.dot;
+        let mut line = self.hw.line;
+        let mut cycles = 0;
+        let mut available = 0;
+        while available < units {
+            cycles += 1;
+            dot += 1;
+            if dot == LINE_CYCLES {
+                dot = 0;
+                line = (line + 1) % FRAME_LINES;
+            }
+            if dot == SPRITE_START { sprites.start(line, self.display_control); }
+            let (attributes, pixels) = sprites.step(self.display_control, &self.oam, self.mosaic, dot);
+            available += u16::from(if oam { !attributes } else { !pixels });
+        }
+        cycles
+    }
+
     pub(crate) fn tile_background_vram_cycles(&self, halfwords: u16, layers: u16, mixed: bool) -> u32 {
         if self.hw.line >= VISIBLE_LINES { return u32::from(halfwords); }
         let text_layers = if mixed { layers & 0x0300 } else { layers };
@@ -462,6 +641,22 @@ impl Bus {
             }
             self.hw.trigger_dma(trigger);
         }
+        if self.hw.dot == SPRITE_START {
+            self.hw.sprites.start(self.hw.line, self.display_control);
+        }
+        if self.display_control & 0x1000 != 0 && self.hw.dot % 2 == 0
+            && self.hw.sprites.target_line.is_some()
+            && (self.hw.sprites.index < 128 || self.hw.sprites.drawing.remaining != 0)
+        {
+            self.hw.sprites.step(self.display_control, &self.oam, self.mosaic, self.hw.dot);
+        }
+        if self.hw.dot == DISPLAY_LATCH_DOT && (self.hw.line < VISIBLE_LINES || self.hw.line >= 225) {
+            if (self.hw.display_latch[0] ^ self.hw.display_latch[1]) & 0x1F80 != 0 {
+                self.finish_pixels_before_video_write();
+            }
+            self.hw.display_latch.rotate_left(1);
+            self.hw.display_latch[2] = self.display_control;
+        }
     }
 
     pub(crate) fn dma_owns_bus(&self) -> bool {
@@ -497,7 +692,10 @@ impl Bus {
     fn start_dma_access(&mut self, channel: usize, addr: u32, phase: DmaPhase) {
         let d = self.hw.dma[channel];
         let uses_gamepak = matches!(addr >> 24, 8..=15);
-        let cycles = self.access_cycles(addr, d.width(channel), d.sequential);
+        // 两端都访问卡带 ROM 时，读阶段已经开启了这笔传输的卡带总线访问。
+        let sequential = d.sequential || (matches!(phase, DmaPhase::Write(_))
+            && gamepak_rom(d.current_source) && gamepak_rom(addr));
+        let cycles = self.access_cycles(addr, d.width(channel), sequential);
         if uses_gamepak {
             self.gamepak_prefetch = Default::default();
         }

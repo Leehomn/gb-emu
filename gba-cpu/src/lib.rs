@@ -283,7 +283,10 @@ impl Bus {
             self.finish_pixels_before_video_write();
         }
         match addr {
-            DISPLAY_CONTROL => self.display_control = value,
+            DISPLAY_CONTROL => {
+                self.display_control = value;
+                self.hw.initialize_display_latch(value);
+            }
             GREEN_SWAP => self.green_swap = value & 1,
             BG_CONTROL_START..=BG_CONTROL_END => {
                 self.bg_control[((addr - BG_CONTROL_START) / 2) as usize] = value;
@@ -500,7 +503,8 @@ impl Bus {
             }
             bg.mosaic_origin
         });
-        let pixels = self.render_line(y, origins, self.drawn_columns..end);
+        let display = self.hw.latched_display_control(self.display_control, 0x1F00);
+        let pixels = self.render_line(y, origins, self.drawn_columns..end, display);
         let range = self.drawn_columns * 3..end * 3;
         self.pending_line[range.clone()].copy_from_slice(&pixels[range]);
         self.drawn_columns = end;
@@ -520,11 +524,11 @@ impl Bus {
                 let row = self.bg_sample_row(index + 2, y) as i32;
                 [0, 1].map(|axis| bg.reference(axis) + row * bg.line_step(axis))
             });
-            self.render_line(y, origins, 0..WIDTH)
+            self.render_line(y, origins, 0..WIDTH, self.display_control)
         }).collect()
     }
 
-    fn render_line(&self, y: usize, affine_origins: [[i32; 2]; 2], mut columns: Range<usize>) -> [u8; WIDTH * 3] {
+    fn render_line(&self, y: usize, affine_origins: [[i32; 2]; 2], mut columns: Range<usize>, display: u16) -> [u8; WIDTH * 3] {
         let mut frame = [0; WIDTH * 3];
         if self.green_swap != 0 {
             // 相邻像素互换绿色，分段边界落在奇数列时也要取到配对像素。
@@ -532,46 +536,21 @@ impl Bus {
             columns.end = columns.end.next_multiple_of(2);
         }
         let output = &mut frame[columns.start * 3..columns.end * 3];
-        if self.display_control & 0x80 != 0 {
+        if display & 0x80 != 0 {
             output.fill(255);
             return frame;
         }
-        let mode = self.display_control & 7;
+        let mode = display & 7;
         if mode > 5 { return frame; }
-        let layer_masks = self.window_layer_masks(y, mode, &columns);
-        let backdrop = ScanlinePixel {
-            color: self.palette_color(0), priority: 4, layer: 5, semi_transparent: false,
-        };
-        let mut pixels = [[backdrop; 2]; WIDTH];
-        if mode < 3 {
-            let text_layers = [4, 2, 0][usize::from(mode)];
-            for bg in 0..text_layers {
-                if self.display_control & (0x100 << bg) != 0 {
-                    self.draw_text_background(bg, y, &mut pixels, &layer_masks, &columns);
-                }
-            }
-            let affine_layers = usize::from(mode);
-            for (index, origin) in affine_origins.into_iter().take(affine_layers).enumerate() {
-                let bg = index + 2;
-                if self.display_control & (0x100 << bg) != 0 {
-                    self.draw_affine_background(bg, origin, &mut pixels, &layer_masks, &columns);
-                }
-            }
-        } else if self.display_control & 0x400 != 0 {
-            self.draw_bitmap_background(mode, affine_origins[0], &mut pixels, &layer_masks, &columns);
-        }
-        if self.display_control & 0x1000 != 0 {
-            self.overlay_sprites(y as i32, mode, &mut pixels, &layer_masks, &columns);
-        }
+        let (pixels, layer_masks) = self.scanline_layers(y, affine_origins, &columns, display);
         let effect = (self.blend_control >> 6) & 3;
         let amount = self.brightness.min(16);
         let eva = (self.blend_alpha & 31).min(16);
         let evb = (self.blend_alpha >> 8).min(16);
         let layers = pixels[columns.clone()].iter().copied();
         for ((rgb, [top, below]), &window_mask) in output.chunks_exact_mut(3).zip(layers).zip(&layer_masks[columns]) {
-            let enabled = window_mask & 0x20 != 0 && self.blend_control & (1 << top.layer) != 0;
-            let blend = (top.semi_transparent || (enabled && effect == 1)) && top.layer != below.layer
-                && self.blend_control & (1 << (8 + below.layer)) != 0;
+            let enabled = self.effect_enabled(top, window_mask);
+            let blend = self.blends_pixel(top, below, enabled);
             for (channel, shift) in rgb.iter_mut().zip([0, 5, 10]) {
                 let value = (top.color >> shift) & 31;
                 // 先计算五位颜色分量，再扩展为八位。
@@ -592,12 +571,77 @@ impl Bus {
         frame
     }
 
-    fn window_layer_masks(&self, y: usize, mode: u16, columns: &Range<usize>) -> [u8; WIDTH] {
-        if self.display_control & 0xE000 == 0 {
+    fn effect_enabled(&self, top: ScanlinePixel, window_mask: u8) -> bool {
+        window_mask & 0x20 != 0 && self.blend_control & (1 << top.layer) != 0
+    }
+
+    fn blends_pixel(&self, top: ScanlinePixel, below: ScanlinePixel, enabled: bool) -> bool {
+        (top.semi_transparent || (enabled && (self.blend_control >> 6) & 3 == 1))
+            && top.layer != below.layer && self.blend_control & (1 << (8 + below.layer)) != 0
+    }
+
+    fn palette_fetches_pixel(&self, row: usize, column: usize, second_color: bool, display: u16) -> bool {
+        let mode = display & 7;
+        if display & 0x80 != 0 || mode > 5 { return false; }
+        let direct_color = matches!(mode, 3 | 5);
+        if !second_color && !direct_color { return true; }
+        if second_color && (self.blend_control & 0x3F00 == 0
+            || ((self.blend_control >> 6) & 3 != 1 && display & 0x1000 == 0))
+        {
+            return false;
+        }
+        let origins = [0, 1].map(|index| {
+            let bg = &self.bg_affine[index];
+            if self.bg_sample_row(index + 2, row) == row { bg.origin } else { bg.mosaic_origin }
+        });
+        let (pixels, masks) = self.scanline_layers(row, origins, &(column..column + 1), display);
+        let [top, below] = pixels[column];
+        if second_color {
+            (!direct_color || below.layer != 2)
+                && self.blends_pixel(top, below, self.effect_enabled(top, masks[column]))
+        } else {
+            top.layer != 2
+        }
+    }
+
+    fn scanline_layers(
+        &self, y: usize, affine_origins: [[i32; 2]; 2], columns: &Range<usize>, display: u16,
+    ) -> ([[ScanlinePixel; 2]; WIDTH], [u8; WIDTH]) {
+        let mode = display & 7;
+        let layer_masks = self.window_layer_masks(y, mode, columns, display);
+        let backdrop = ScanlinePixel {
+            color: self.palette_color(0), priority: 4, layer: 5, semi_transparent: false,
+        };
+        let mut pixels = [[backdrop; 2]; WIDTH];
+        if mode < 3 {
+            let text_layers = [4, 2, 0][usize::from(mode)];
+            for bg in 0..text_layers {
+                if display & (0x100 << bg) != 0 {
+                    self.draw_text_background(bg, y, &mut pixels, &layer_masks, columns);
+                }
+            }
+            let affine_layers = usize::from(mode);
+            for (index, origin) in affine_origins.into_iter().take(affine_layers).enumerate() {
+                let bg = index + 2;
+                if display & (0x100 << bg) != 0 {
+                    self.draw_affine_background(bg, origin, &mut pixels, &layer_masks, columns);
+                }
+            }
+        } else if display & 0x400 != 0 {
+            self.draw_bitmap_background(mode, affine_origins[0], &mut pixels, &layer_masks, columns);
+        }
+        if display & 0x1000 != 0 {
+            self.overlay_sprites(y as i32, mode, &mut pixels, &layer_masks, columns);
+        }
+        (pixels, layer_masks)
+    }
+
+    fn window_layer_masks(&self, y: usize, mode: u16, columns: &Range<usize>, display: u16) -> [u8; WIDTH] {
+        if display & 0xE000 == 0 {
             return [0x3F; WIDTH];
         }
         let mut masks = [self.window_control[1] as u8; WIDTH];
-        if self.display_control & 0x9000 == 0x9000 {
+        if display & 0x9000 == 0x9000 {
             let inside = (self.window_control[1] >> 8) as u8;
             self.for_each_sprite_pixel(y as i32, mode, true, columns, |x, _, _, _| {
                 masks[x] = inside;
@@ -605,7 +649,7 @@ impl Bus {
         }
         // 从低到高覆盖：精灵窗口、WIN1、WIN0。
         for window in (0..2).rev() {
-            if self.display_control & (0x2000 << window) == 0
+            if display & (0x2000 << window) == 0
                 || !Self::window_contains(self.window_bounds[2 + window], y as u8)
             {
                 continue;
@@ -797,6 +841,15 @@ impl Bus {
     }
 
     // 显示精灵和精灵窗口共用同一套图块取样。
+    fn sprite_size(a0: u16, a1: u16) -> Option<(i32, i32)> {
+        const SIZES: [[(i32, i32); 4]; 3] = [
+            [(8, 8), (16, 16), (32, 32), (64, 64)],
+            [(16, 8), (32, 8), (32, 16), (64, 32)],
+            [(8, 16), (8, 32), (16, 32), (32, 64)],
+        ];
+        SIZES.get(usize::from(a0 >> 14)).map(|sizes| sizes[usize::from(a1 >> 14)])
+    }
+
     fn for_each_sprite_pixel(
         &self,
         y: i32,
@@ -805,27 +858,21 @@ impl Bus {
         columns: &Range<usize>,
         mut visit: impl FnMut(usize, u8, u16, u16),
     ) {
-        const SIZE: [[(i32, i32); 4]; 3] = [
-            [(8, 8), (16, 16), (32, 32), (64, 64)],
-            [(16, 8), (32, 8), (32, 16), (64, 32)],
-            [(8, 16), (8, 32), (16, 32), (32, 64)],
-        ];
         let one_dimensional = self.display_control & 0x40 != 0;
         let mut cycles: i32 = if self.display_control & 0x20 == 0 { 1210 } else { 954 };
         for entry in self.oam.chunks_exact(8) {
             let a = |i| u16::from_le_bytes([entry[i], entry[i + 1]]);
             let (a0, a1, a2) = (a(0), a(2), a(4));
-            let shape = usize::from(a0 >> 14);
+            let Some((width, height)) = Self::sprite_size(a0, a1) else { continue; };
             let tile = usize::from(a2 & 1023);
             let object_mode = (a0 >> 10) & 3;
             let affine = a0 & 0x0100 != 0;
             let double_size = a0 & 0x0200 != 0;
-            if shape == 3 || (!affine && double_size) || (mode >= 3 && tile < 512)
+            if (!affine && double_size) || (mode >= 3 && tile < 512)
                 || object_mode == 3
             {
                 continue;
             }
-            let (width, height) = SIZE[shape][usize::from(a1 >> 14)];
             let scale = if double_size { 2 } else { 1 };
             let (area_width, area_height) = (width * scale, height * scale);
             let mut sy = i32::from(a0 & 255);
@@ -1233,7 +1280,7 @@ impl Cpu {
                 (true, true) => base.wrapping_add(4),
                 (false, false) => base.wrapping_sub(bytes).wrapping_add(4),
                 (false, true) => base.wrapping_sub(bytes),
-            } & !3;
+            };
             let mut next = pc.wrapping_add(4);
             if load && mask & (1 << 15) != 0 { bus.jump(next); }
             // 寄存器从低编号到高编号，对应从低地址到高地址。
@@ -1556,7 +1603,7 @@ impl Cpu {
                 if count == 0 { return Err(Fault::Unsupported(u32::from(word))); }
                 if pop && extra { bus.jump(0); }
                 let sp = self.regs[13];
-                let mut address = (if pop { sp } else { sp.wrapping_sub(count * 4) }) & !3;
+                let mut address = if pop { sp } else { sp.wrapping_sub(count * 4) };
                 for reg in 0..8 {
                     if mask & (1 << reg) == 0 { continue; }
                     if pop { self.regs[reg] = bus.read_word(address)?; }
@@ -1577,13 +1624,13 @@ impl Cpu {
                 let base = self.regs[rd];
                 if mask == 0 {
                     if load { bus.jump(0); }
-                    let target = if load { Some(bus.read_word(base & !3)? & !1) }
-                        else { bus.write_word(base & !3, pc.wrapping_add(6))?; None };
+                    let target = if load { Some(bus.read_word(base)? & !1) }
+                        else { bus.write_word(base, pc.wrapping_add(6))?; None };
                     self.regs[rd] = base.wrapping_add(0x40);
                     return Ok(target.map_or(pc.wrapping_add(2), |addr| bus.jump(addr)));
                 }
                 let end = base.wrapping_add(mask.count_ones() * 4);
-                let mut addr = base & !3;
+                let mut addr = base;
                 let first = mask.trailing_zeros() as usize;
                 for reg in 0..8 {
                     if mask & (1 << reg) == 0 { continue; }

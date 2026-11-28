@@ -496,6 +496,31 @@ fn arm_program_paints_two_mode3_pixels() {
 }
 
 #[test]
+fn midframe_background_enable_waits_before_appearing_in_scanout() {
+    const LINE: u32 = 1232;
+    let mut bus = Bus::new(&[]);
+    bus.write_half(0x0400_0000, 3).unwrap();
+    for row in 0..=3u32 {
+        for column in 0..240u32 {
+            bus.write_half(0x0600_0000 + 2 * (row * 240 + column), 31).unwrap();
+        }
+    }
+    bus.advance(20).unwrap();
+    bus.write_half(0x0400_0000, 0x0403).unwrap();
+    bus.advance(2 * LINE + 1006 - 20).unwrap();
+    for row in 0..2 {
+        let from = row * 240 * 3;
+        assert_eq!(bus.scanout_rgb()[from..from + 3], [0, 0, 0]);
+    }
+    assert_eq!(bus.scanout_rgb()[(2 * 240 + 32) * 3..][..3], [255, 0, 0]);
+    bus.advance(LINE - 1006 + 80).unwrap();
+    bus.write_half(0x0400_0000, 3).unwrap();
+    bus.advance(1006 - 80).unwrap();
+    assert_eq!(bus.scanout_rgb()[3 * 240 * 3..][..3], [255, 0, 0]);
+    assert_eq!(bus.scanout_rgb()[(3 * 240 + 32) * 3..][..3], [0, 0, 0]);
+}
+
+#[test]
 fn mode4_switches_framebuffer_pages_and_uses_palette_indices() {
     let mut bus = Bus::new(&[]);
     bus.write_half(0x0500_0002, 0x001F).unwrap();

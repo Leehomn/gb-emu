@@ -15,7 +15,7 @@ cargo test --offline --locked
 ## 已实现的范围
 
 - ARM 与 Thumb 指令覆盖算术、逻辑、移位、乘加、访存、块传输与跨模式调用，并处理 CPSR/SPSR 和各模式的独立寄存器。
-- CPU 分别推进取指、访存和内部周期。使用两级预取保存下一条和再下一条指令，并在跳转、模式切换和异常时从新地址重取。卡带访问区分顺序与非顺序等待，读取 `WAITCNT` 的配置并模拟八个半字的预取缓冲。
+- CPU 分别推进取指、访存和内部周期。CPU 内部运算可和 DMA 同拍推进，取指或访存时等待 DMA 交还总线。使用两级预取保存下一条和再下一条指令，并在跳转、模式切换和异常时从新地址重取。卡带访问区分顺序与非顺序等待，读取 `WAITCNT` 的配置并模拟八个半字的预取缓冲。
 - 启动支持从地址 0 执行自备的 16 KiB BIOS，或初始化常用栈后直接运行卡带。已验证 SWI、未定义指令、IRQ 的向量进入与返回，以及 HALT 和按键唤醒 STOP。
 - 视频：Mode 0–5 按扫描线生成画面。Mode 0–2 支持普通图块和仿射背景，Mode 3–5 支持位图变换，Mode 4、5 可切页。支持 4bpp 和 8bpp 精灵、1D 和 2D 图块编址、仿射和倍尺寸裁剪。支持背景和精灵马赛克、矩形窗口、精灵窗口、混色和亮度特效。
 - 外设包括四个定时器、显示和定时器中断、四通道普通 DMA、DMA1/2 音频补给及 DMA3 显示同步传输。
@@ -32,7 +32,7 @@ cargo test --offline --locked
 
 桌面窗口每次只传入按键状态并显示画面。自制 ARM 程序读取 `KEYINPUT`（地址 `0x04000130`），通过 `TST` 判断按键并决定新位置，再用 `STR` 擦掉旧方块、画出新方块。自动测试检查四个方向、松开按键和屏幕边界。每次窗口刷新对应一轮演示程序循环。普通卡带按硬件的扫描线事件推进整帧。
 
-尚待完善的功能包括背景寄存器锁存、精灵显存争用、卡带访存边界、音频 PWM 与精确混音、Flash 写入和擦除耗时，以及更多卡带的兼容性。位图模式下，映射到背景区域的部分精灵显存镜像读取为零，写入会被忽略。
+尚待完善的功能包括图块与精灵数据的逐拍锁存、卡带访存边界、音频 PWM 与精确混音、Flash 写入和擦除耗时，以及更多卡带的兼容性。位图模式下，映射到背景区域的部分精灵显存镜像读取为零，写入会被忽略。
 
 ## 本地网页播放器
 
@@ -74,7 +74,7 @@ cargo run --release --offline --locked -- --rom target/jsmolka/thumb.gba 204000 
 
 ## CPU 时序和 BIOS 验收
 
-从复位向量运行 [Cult-of-GBA 开源替代 BIOS](https://github.com/Cult-of-GBA/BIOS/tree/a30e9a96df083628b650724b7d4d7112b4070b98)，启动 [mGBA 测试套件](https://github.com/mgba-emu/suite)。移位 **140/140**、进借位 **93/93**、长乘法 **72/72**，时序 **1726/2020**，内存 **1482/1552**。剩余差异见 [路线图](ROADMAP.md)。
+从复位向量运行 [Cult-of-GBA 开源替代 BIOS](https://github.com/Cult-of-GBA/BIOS/tree/a30e9a96df083628b650724b7d4d7112b4070b98)，启动 [mGBA 测试套件](https://github.com/mgba-emu/suite)。移位 **140/140**、进借位 **93/93**、长乘法 **72/72**，时序 **1834/2020**，内存 **1506/1552**。剩余差异见 [路线图](ROADMAP.md)。
 
 + 开源替代 BIOS 保存为 `target/cult-gba-bios.bin`，SHA-256 为 `61af6e8c2db6cf24aa6924e8133f6a50833158fca33ff08ea5e11e1a06e132f2`。
 + [预编译测试 ROM](https://raw.githubusercontent.com/Asphaltian/sgba/main/Assets/roms/suite.gba) 保存为 `target/mgba-suite.gba`，本次运行的 SHA-256 为 `c8f9846058af9472c321000900ceb57e14fb42ca05d77b17eb7cbe8736c85512`。
@@ -202,4 +202,10 @@ cargo test --release --offline --locked --test cpu_roms hardware_rom_measures --
 
 DMA 占用总线时，CPU 等到总线可用才继续，显示、定时器和音频时钟仍推进。纯内存 DMA 期间，空闲的卡带总线继续填充指令预取。DMA 读取或写入卡带时清空预取。交回总线后，CPU 可以消费已预取的指令。若首笔取指需要直接访问卡带，则使用非顺序等待。预取即将完成时是否需要额外等待，仍待逐拍验证。宿主可以用 `Bus::advance` 推进指定的硬件周期，再读取 DMA 传输结果。
 
-该模型使用总线写入时刻作为分段边界。显示硬件对不同图层的预取、寄存器锁存，以及图块和精灵的争用仍待模拟。
+### 精灵、调色板与显示控制时序
+
+精灵引擎从每行第 40 拍开始准备下一条可见扫描线，按两拍一个时隙读取 OAM 属性、仿射矩阵和精灵瓦片。CPU 和 DMA 分别等待 OAM 或精灵显存释放。打开 HBlank 空闲位会缩短精灵的取数窗口。强制空白时，精灵引擎仍由当前精灵启用位控制。 [NanoBoyAdvance 精灵取数参考](https://github.com/nba-emu/NanoBoyAdvance/blob/master/src/nba/src/hw/ppu/sprite.cc)
+
+调色板按画面合成需求抢占总线。底色和索引色占用主颜色时隙，透明混色才按需读取第二个颜色。Mode 3 和 Mode 5 的 RGB555 像素可以直接使用显存中的颜色。 [NanoBoyAdvance 画面合成参考](https://github.com/nba-emu/NanoBoyAdvance/blob/master/src/nba/src/hw/ppu/merge.cc)
+
+显示控制寄存器每行第 40 拍采样。背景启用和退出强制空白要等采样值经过三段锁存，关闭背景或开启强制空白立即生效。实时输出会在锁存改变时结算已完成的画面。图块数据、精灵像素和调色板占用仍有部分依靠分段渲染的取样结果，寄存器在取数途中改写的极端情况待进一步对照真机。 [NanoBoyAdvance 锁存参考](https://github.com/nba-emu/NanoBoyAdvance/blob/master/src/nba/src/hw/ppu/ppu.cc#L234-L237)

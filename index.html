@@ -569,7 +569,7 @@ body::before{z-index:3;opacity:.17;}body::after{z-index:1;opacity:.06;}
           <div><dt>75/75</dt><dd>Blargg GB CPU 指令测试</dd></div>
           <div><dt>24/24</dt><dd>Mealybug DMG 逐像素对比</dd></div>
           <div><dt>23,040 px</dt><dd>cgb-acid2 GBC 彩色对齐</dd></div>
-          <div><dt>102 PASS</dt><dd>GBA 最近整套回归；显存时序见实测</dd></div>
+          <div><dt>115 PASS</dt><dd>GBA 最近整套回归通过</dd></div>
         </dl>
       </div>
 
@@ -661,9 +661,9 @@ body::before{z-index:3;opacity:.17;}body::after{z-index:1;opacity:.06;}
 <tr><td>GB</td><th scope="row">Mealybug Tearoom</th><td>DMG 画面逐像素对比 <strong>24/24</strong></td></tr>
 <tr><td>GBC</td><th scope="row">cgb-acid2</th><td><strong>23,040 个像素</strong>与参考图一致</td></tr>
 <tr><td>GBA</td><th scope="row">jsmolka ARM / Thumb</th><td>两个指令测试 ROM 均显示全部通过</td></tr>
-<tr><td>GBA</td><th scope="row">mGBA Test Suite</th><td>移位 <strong>140/140</strong> · 进借位 <strong>93/93</strong> · 长乘法 <strong>72/72</strong><br>时序 <strong>1726/2020</strong> · 内存 <strong>1482/1552</strong> · BIOS 数学 <strong>603/615</strong><br><small>使用开源替代 BIOS；仍有未通过项。</small></td></tr>
-<tr><td>GBA</td><th scope="row">NanoBoyAdvance 显存时序 ROM</th><td>Mode 0、2–5：<strong>11 组配置</strong>，每组 <strong>1,231 个访问位置</strong>与参考模型一致</td></tr>
-<tr><td>GBA</td><th scope="row">整套回归与整机示例</th><td>最近一次整套回归通过 <strong>102 项</strong>；Tonc 示例与开源 Pong 已验证画面与输入</td></tr></tbody></table></div>
+<tr><td>GBA</td><th scope="row">mGBA Test Suite</th><td>移位 <strong>140/140</strong> · 进借位 <strong>93/93</strong> · 长乘法 <strong>72/72</strong><br>时序 <strong>1834/2020</strong> · 内存 <strong>1506/1552</strong> · BIOS 数学 <strong>603/615</strong><br><small>使用开源替代 BIOS；仍有未通过项。</small></td></tr>
+<tr><td>GBA</td><th scope="row">NanoBoyAdvance 显存时序 ROM</th><td>背景显存 <strong>11 组</strong> · 精灵 <strong>14 组</strong> · 调色板 <strong>3 组</strong> · 显示控制 <strong>4 组</strong></td></tr>
+<tr><td>GBA</td><th scope="row">整套回归与整机示例</th><td>最近一次整套回归通过 <strong>115 项</strong>；Tonc 示例与开源 Pong 已验证画面与输入</td></tr></tbody></table></div>
 <p class="bench-note">Mode 1 混合背景已通过项目内 CPU、DMA 和消隐边界用例，逐拍真机对照仍待完成。显存时序结果来自模拟器与参考模型对比；实际手机及商业卡带兼容性仍待验证。<a href="https://github.com/Leehomn/gb-emu/blob/master/gba-cpu/README.md">验证与复现步骤 ↗</a></p>
 </div></section>
 <section id="tech" class="section" data-od-id="tech"><div class="container"><header class="section-head reveal"><p class="eyebrow">TECH · 三世代核心架构</p><h2>六个模块，接起三代掌机。</h2><p class="section-sub">用同一条取指循环，逐步走到画面、声音和整机时序。</p></header><div class="tech-grid"><article class="tech-card reveal"><p class="tag">GB · CPU</p><h3>LR35902 (SM83) 处理器</h3><p>主指令集与 CB 前缀位操作，逐条实现取指、译码和执行，对齐 Z / N / H / C 标志位。Blargg CPU 指令测试 75/75。</p><div class="card-bottom"><figure class="shot"><img src="assets/img/exam.png" alt="Blargg 指令测试画面" loading="lazy" data-slot><figcaption class="slot-hint">等待放入截图<code>assets/img/exam.png</code></figcaption></figure></div></article>
@@ -671,7 +671,7 @@ body::before{z-index:3;opacity:.17;}body::after{z-index:1;opacity:.06;}
 <article class="tech-card reveal"><p class="tag">GB · IRQ & TIMER</p><h3>中断与定时器总线</h3><p>VBlank / LCD / Timer / Serial / Joypad 五个中断向量统一调度，IME 与 IE/IF 控制请求；DIV、TIMA/TMA/TAC 负责分频、溢出回装与定时中断。</p><div class="card-bottom"><div class="reg"><b>IE</b> @ $FFFF · <b>IF</b> @ $FF0F<br>DIV @ $FF04 · TIMA @ $FF05<br>TMA @ $FF06 · TAC @ $FF07<br>中断向量 $40–$60 · IME</div></div></article>
 <article class="tech-card reveal"><p class="tag">GB · APU & MBC</p><h3>四声道音频与卡带存档</h3><p>四声道音频采用去直流混音；MBC1/3/5 支持卡带换页与 SRAM 存档，MBC3 RTC 按墙钟推进。</p></article>
 <article class="tech-card reveal"><p class="tag">GBC · CGB</p><h3>从四阶绿到彩色图层</h3><p>彩色背景与精灵、显存和工作内存分区、双倍速切换、普通与 HBlank 显存 DMA。cgb-acid2 的 23,040 px 与参考图逐像素一致。</p></article>
-<article class="tech-card reveal"><p class="tag">GBA · ARM7TDMI</p><h3>ARM/Thumb 与整机总线</h3><p>ARM/Thumb 两级预取、WAITCNT 八半字缓冲、Mode 0–5 扫描线分段与背景显存争用、DMA0–3、32,768 Hz 立体声，以及 SRAM/Flash/EEPROM。精灵争用、寄存器锁存与部分时序仍待细化。</p></article></div></div></section>
+<article class="tech-card reveal"><p class="tag">GBA · ARM7TDMI</p><h3>ARM/Thumb 与整机总线</h3><p>ARM/Thumb 两级预取、WAITCNT 八半字缓冲、Mode 0–5 扫描线分段与背景显存争用、DMA0–3、32,768 Hz 立体声，以及 SRAM/Flash/EEPROM。已验证精灵和调色板等待、显示控制锁存，以及 CPU、卡带预取与 DMA 的总线交接。</p></article></div></div></section>
 
 <section id="path" class="section" data-od-id="path"><div class="container">
 <header class="section-head reveal"><p class="eyebrow">JOURNEY · 学习与开发路线</p><h2>从第一条指令，到三代掌机。</h2><p class="section-sub">每一站解决一组新的硬件问题，再用测试检查结果。</p></header>
@@ -681,8 +681,8 @@ body::before{z-index:3;opacity:.17;}body::after{z-index:1;opacity:.06;}
 <li class="tl-item reveal"><span class="tl-node" aria-hidden="true"></span><span class="tl-tag">STAGE 04</span><h3>Blargg：75/75</h3><p>让 CPU 逐条接受独立指令测试，再向画面与外设推进。</p></li>
 <li class="tl-item reveal"><span class="tl-node" aria-hidden="true"></span><span class="tl-tag">STAGE 05</span><h3>PPU / 音频 / MBC3/5</h3><p>接入逐周期画面、四声道音频、卡带换页与 RTC；Mealybug DMG 逐像素对比 24/24。</p></li>
 <li class="tl-item reveal"><span class="tl-node" aria-hidden="true"></span><span class="tl-tag">STAGE 06</span><h3>GBC：彩色与双倍速</h3><p>接入彩色图层、内存分区与显存 DMA，cgb-acid2 的 23,040 个像素与参考图一致。</p></li>
-<li class="tl-item reveal lit"><span class="tl-node" aria-hidden="true"></span><span class="tl-tag">STAGE 07</span><h3>GBA：ARM/Thumb 到整机</h3><p>接入画面、声音、DMA 与存档；最近一次整套回归通过 102 项，继续完善时序精度。</p></li></ol>
-<h3 class="next-title">NEXT · GBA 开发路线</h3><div class="machine-grid"><article class="tech-card reveal"><p class="tag">NEXT / 01</p><h3>画面时序</h3><p>继续验证精灵争用、行中改寄存器的生效时刻，以及真机与参考模型的差异。</p></article><article class="tech-card reveal"><p class="tag">NEXT / 02</p><h3>CPU 与内存</h3><p>按失败用例检查卡带预取、DMA 后重新取指与内存边界。</p></article><article class="tech-card reveal"><p class="tag">NEXT / 03</p><h3>整机与手机</h3><p>细化音频混音和 Flash 写入耗时，验证实际手机触控、声音与更多卡带的启动、游玩和读档。</p></article></div>
+<li class="tl-item reveal lit"><span class="tl-node" aria-hidden="true"></span><span class="tl-tag">STAGE 07</span><h3>GBA：ARM/Thumb 到整机</h3><p>接入画面、声音、DMA 与存档；最近一次整套回归通过 115 项，继续完善时序精度。</p></li></ol>
+<h3 class="next-title">NEXT · GBA 开发路线</h3><div class="machine-grid"><article class="tech-card reveal"><p class="tag">NEXT / 01</p><h3>画面时序</h3><p>继续对照真机的行内寄存器变化和显存取数边界。</p></article><article class="tech-card reveal"><p class="tag">NEXT / 02</p><h3>CPU 与内存</h3><p>按失败用例检查卡带预取与 DMA 的交接、镜像读数和 BIOS 行为。</p></article><article class="tech-card reveal"><p class="tag">NEXT / 03</p><h3>整机与手机</h3><p>细化音频混音和 Flash 写入耗时，验证实际手机触控、声音与更多卡带的启动、游玩和读档。</p></article></div>
 <div class="terminal reveal"><p class="eyebrow">LOCAL · 本地运行与仓库文档</p><pre><code>cargo test --locked
 cargo run --release --locked -- path/to/game.gb
 cargo test --locked --manifest-path gba-cpu/Cargo.toml</code></pre><div class="doc-links"><a href="https://github.com/Leehomn/gb-emu/blob/master/POSTMORTEM.md">POSTMORTEM.md ↗</a><a href="https://github.com/Leehomn/gb-emu/blob/master/gba-cpu/README.md">gba-cpu/README.md ↗</a><a href="https://github.com/Leehomn/gb-emu/blob/master/gba-cpu/ROADMAP.md">gba-cpu/ROADMAP.md ↗</a></div></div>

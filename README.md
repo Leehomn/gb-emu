@@ -23,10 +23,10 @@ GBA 网页支持键盘和触屏，声音通过「开启声音」打开。载入�
 | GB | [Mealybug Tearoom](https://github.com/mattcurrie/mealybug-tearoom-tests) | DMG 画面逐像素对比 **24/24** |
 | GBC | [cgb-acid2](https://github.com/mattcurrie/cgb-acid2) | **23,040 个像素**与参考图一致 |
 | GBA | [jsmolka ARM / Thumb](https://github.com/jsmolka/gba-tests) | 两个指令测试 ROM 均显示全部通过 |
-| GBA | [mGBA Test Suite](https://github.com/mgba-emu/suite) | 移位 **140/140**，进借位 **93/93**，长乘法 **72/72**，时序 **1726/2020**，内存 **1482/1552**，BIOS 数学 **603/615** |
-| GBA | [NanoBoyAdvance 显存时序 ROM](https://github.com/nba-emu/hw-test/tree/master/ppu/ram-access-timing) | 对 Mode 0、2–5 测了 **11 组配置**，每组 **1,231 个访问位置**，结果与参考模型一致 |
+| GBA | [mGBA Test Suite](https://github.com/mgba-emu/suite) | 移位 **140/140**，进借位 **93/93**，长乘法 **72/72**，时序 **1834/2020**，内存 **1506/1552**，BIOS 数学 **603/615** |
+| GBA | [NanoBoyAdvance 显存时序 ROM](https://github.com/nba-emu/hw-test/tree/master/ppu/ram-access-timing) | 背景显存 **11 组**、精灵 **14 组**、调色板 **3 组**、显示控制 **4 组**。逐拍访问测试每组测量 **1,231 个位置** |
 
-GBA 最近一次整套回归通过 **102 项**。Tonc 示例和开源 Pong 已验证画面与输入。mGBA 套件使用开源替代 BIOS。Mode 1 混合背景通过了项目内的 CPU、DMA 和消隐边界用例，逐拍真机对照仍待完成。 [GBA 验证与复现步骤](./gba-cpu/README.md)
+GBA 最近一次整套回归通过 **115 项**。Tonc 示例和开源 Pong 已验证画面与输入。mGBA 套件使用开源替代 BIOS。Mode 1 混合背景通过了项目内的 CPU、DMA 和消隐边界用例，逐拍真机对照仍待完成。 [GBA 验证与复现步骤](./gba-cpu/README.md)
 
 ## 本地运行
 
@@ -49,8 +49,8 @@ cargo test --locked --manifest-path gba-cpu/Cargo.toml
 
 ## 开发路线
 
-1. **画面时序**。Mode 0–5 的背景显存等待已接入。接下来验证精灵争用、画到一半改寄存器的生效时刻，以及真机与参考模型的差异。
-2. **CPU 与内存**。继续按失败用例检查卡带预取、DMA 结束后的重新取指和内存边界。
+1. **画面时序**。Mode 0–5 已接入背景显存等待，并验证了精灵、调色板争用和显示控制锁存。下一步对照真机的行内寄存器变化与取数边界。
+2. **CPU 与内存**。已修正非对齐 SRAM 批量访问、CPU 与 DMA 重叠、卡带预取和 DMA 首次访问等待。继续排查卡带预取与 DMA 交接、镜像读数和 BIOS 相关差异。
 3. **整机与手机**。细化音频混音和 Flash 写入耗时，再分别验证实际手机上的触控、声音，以及更多卡带的启动、持续游玩和读档。
 
 [查看 GBA 整机路线图](./gba-cpu/ROADMAP.md)

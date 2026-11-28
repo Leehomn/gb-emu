@@ -169,6 +169,24 @@ fn dma_waits_for_both_background_types_in_mode_one() {
 }
 
 #[test]
+fn dma_waits_for_sprite_pixels_to_release_vram() {
+    const DMA3: u32 = 0x0400_00D4;
+    const SRC: u32 = 0x0300_0000;
+    const OBJ: u32 = 0x0601_0000;
+    let mut bus = Bus::new(&[]);
+    bus.write_half(0x0400_0000, 0x1000).unwrap();
+    bus.write_half(SRC, 0x1234).unwrap();
+    bus.write_word(DMA3, SRC).unwrap();
+    bus.write_word(DMA3 + 4, OBJ).unwrap();
+    bus.advance(40).unwrap();
+    bus.write_word(DMA3 + 8, 0x8000_0001).unwrap();
+    bus.advance(4).unwrap();
+    assert_eq!(bus.read_half(OBJ), Ok(0));
+    bus.advance(1).unwrap();
+    assert_eq!(bus.read_half(OBJ), Ok(0x1234));
+}
+
+#[test]
 fn dma_uses_byte_wide_sram_bus_for_reads_and_writes() {
     const IWRAM: u32 = 0x0300_0000;
     const SRAM: u32 = 0x0E00_0000;
@@ -371,6 +389,33 @@ fn gamepak_dma_uses_waitcnt_for_first_and_sequential_reads() {
     assert_eq!(bus.read_word(0x0300_0100), Ok(0x0000_1234));
     bus.advance(1).unwrap();
     assert_eq!(bus.read_word(0x0300_0100), Ok(0xBEEF_1234));
+}
+
+#[test]
+fn dma_between_gamepak_addresses_charges_only_one_initial_wait() {
+    const DMA3: u32 = 0x0400_00D4;
+    const SOURCE: u32 = ROM_START + 4;
+
+    for (dest, waitcnt, word, cycles) in [
+        (ROM_START + 0x40, 0x0000, false, 12),
+        (ROM_START + 0x40, 0x0000, true, 18),
+        (ROM_START + 0x40, 0x0010, false, 11),
+        (ROM_START + 0x40, 0x0010, true, 15),
+        (ROM_START + 0x2_0000, 0x0000, false, 14),
+    ] {
+        let mut bus = Bus::new(&[0; 2]);
+        bus.write_half(0x0400_0204, waitcnt).unwrap();
+        bus.write_word(DMA3, SOURCE).unwrap();
+        bus.write_word(DMA3 + 4, dest).unwrap();
+        let control = 0x8000_0001 | (u32::from(word) << 26);
+        bus.write_word(DMA3 + 8, control).unwrap();
+
+        bus.advance(cycles - 1).unwrap();
+        assert_ne!(bus.read_half(DMA3 + 10).unwrap() & 0x8000, 0);
+        bus.advance(1).unwrap();
+        assert_eq!(bus.read_half(DMA3 + 10).unwrap() & 0x8000, 0,
+            "目标 {dest:08X}，WAITCNT={waitcnt:04X}，32 位={word}");
+    }
 }
 
 #[test]

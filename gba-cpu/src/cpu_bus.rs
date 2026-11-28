@@ -31,11 +31,16 @@ impl Bus {
         let wait = u32::from(self.hw.waitcnt);
         match addr >> 24 {
             2 => if width == 4 { 6 } else { 3 },
-            5 => if width == 4 { 2 } else { 1 },
+            5 => self.palette_access_cycles(if width == 4 { 2 } else { 1 }),
             6 => {
                 let halfwords = if width == 4 { 2 } else { 1 };
                 let video = self.display_control;
                 let offset = addr & 0x1_FFFF;
+                let obj_start = if (3..=5).contains(&(video & 7)) { 0x1_4000 } else { 0x1_0000 };
+                if offset >= obj_start && video & 0x1000 != 0 {
+                    return self.sprite_access_cycles(halfwords, false);
+                }
+                let video = self.hw.latched_display_control(video, 0x0F00);
                 if video & 0x0080 != 0 {
                     return u32::from(halfwords);
                 }
@@ -60,6 +65,7 @@ impl Bus {
                     self.hw.background_vram_cycles(halfwords, fetch_slots)
                 }
             }
+            7 if self.display_control & 0x1000 != 0 => self.sprite_access_cycles(1, true),
             0x08..=0x0D => {
                 let region = (addr >> 25) - 4;
                 let first = [5, 4, 3, 9][((wait >> (2 + region * 3)) & 3) as usize];
@@ -98,7 +104,12 @@ impl Bus {
         let cost = if gamepak_rom(addr) && self.hw.waitcnt & 0x4000 != 0 {
             let buffered = sequential && addr == self.gamepak_prefetch.next;
             if !buffered {
-                self.gamepak_prefetch = GamePakPrefetch { next: addr, ..Default::default() };
+                let queue = &self.gamepak_prefetch;
+                // 卡带数据访问会打断预取。同地址、尚未读完的指令首个半字保留已等过的拍数。
+                let partial = if !after_dma && queue.next == addr && queue.ready == 0 {
+                    queue.partial.min(self.access_cycles(addr, 2, false) - 1)
+                } else { 0 };
+                self.gamepak_prefetch = GamePakPrefetch { next: addr, partial, ..Default::default() };
             }
             // DMA 打断总线的顺序访问，已有的卡带预取仍可继续供给指令。
             let sequential = sequential && (!after_dma || buffered);
@@ -142,6 +153,8 @@ impl Bus {
     }
 
     pub(crate) fn refill_pipeline(&mut self, pc: u32, width: u32) -> Result<Pipeline, Fault> {
+        // 跳转重新取指，即使目标地址碰巧等于旧预取地址，也重新开始。
+        self.gamepak_prefetch = GamePakPrefetch::default();
         let first = self.clock_fetch(pc, width, false)?;
         let second = self.clock_fetch(pc.wrapping_add(width), width, true)?;
         Ok(Pipeline { pc, width, words: [first, second] })
@@ -184,10 +197,8 @@ impl<'a> CpuBus<'a> {
 
     pub fn idle(&mut self, cycles: u32) -> Result<(), Fault> {
         self.fetch(self.internal_fetch_is_sequential())?;
-        self.bus.wait_for_dma()?;
-        self.bus.fill_gamepak(cycles);
-        self.bus.advance_cpu_access(cycles);
-        Ok(())
+        // 内部周期不占用访存总线，DMA 可在同一拍推进。
+        self.bus.advance(cycles)
     }
 
     fn internal_fetch_is_sequential(&self) -> bool {
@@ -292,6 +303,8 @@ impl<'a> CpuBus<'a> {
     }
 
     pub fn read_word(&mut self, addr: u32) -> Result<u32, Fault> {
+        // 批量读取普通内存按字对齐。八位卡带存档总线保留原地址选字节。
+        let addr = if save_bus(addr) { addr } else { addr & !3 };
         self.data_cycle(addr, 4, false)?;
         let value = self.sample_word(addr);
         self.bus.advance_cpu_access(1);
@@ -316,8 +329,7 @@ impl<'a> CpuBus<'a> {
     }
 
     pub fn load_word(&mut self, addr: u32) -> Result<u32, Fault> {
-        let aligned = if save_bus(addr) { addr } else { addr & !3 };
-        Ok(self.read_word(aligned)?.rotate_right((addr & 3) * 8))
+        Ok(self.read_word(addr)?.rotate_right((addr & 3) * 8))
     }
 
     pub fn write_byte(&mut self, addr: u32, value: u8) -> Result<(), Fault> {
