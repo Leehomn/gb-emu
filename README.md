@@ -1,116 +1,63 @@
-# gb-emu —— 从零手写的 Game Boy 模拟器
+# RustBoy · 用 Rust 从零写 GB、GBC 和 GBA 模拟器
 
-> **在线试玩（作品展示站）**：<https://leehomn.github.io/gb-emu/>
-> **Game Boy Advance**：[GBA 核心与验证记录](./gba-cpu/README.md)
-> **项目复盘（为什么这么走、踩了哪些坑）**：见 [POSTMORTEM.md](./POSTMORTEM.md)
+从 Python 写 CHIP-8 的取指循环开始，我用 Rust 实现了 Game Boy 的 CPU、画面、声音和卡带。接着给 Game Boy Color 加入彩色与双倍速，再从 ARM/Thumb 指令起步做 Game Boy Advance。现在三个机型都能在浏览器里运行，GBA 正在补时序精度和游戏兼容性。
 
-一个用 Rust 写的 Game Boy（DMG）模拟器核心，配套一个纯 JS 的网页版，能跑 Adjustris、2048、扫雷等开源游戏。
+[打开作品站](https://leehomn.github.io/gb-emu/) · [直接打开 GBA 播放器](https://leehomn.github.io/gb-emu/gba-cpu/web/) · [项目复盘](./POSTMORTEM.md)
 
-这是我学习「模拟器到底怎么工作」的作品：从 CHIP-8（Python）→ Rust → Game Boy，CPU、中断、定时器、PPU 全部从零实现，每一行都能解释为什么这么写。
+## 在线游玩
 
-## 已实现
+| 机型 | 怎么开始 | 当前进度 |
+| --- | --- | --- |
+| **Game Boy** | 在[游玩区](https://leehomn.github.io/gb-emu/#play)启动模拟器，可玩 Adjustris、2048 和扫雷 | SM83 指令、逐周期画面、音频、MBC1/3/5 和卡带存档 |
+| **Game Boy Color** | 用同一个播放器载入带 CGB 标记的卡带，自动切换彩色模式 | 彩色图层、显存与工作内存分区、双倍速、普通及 HBlank 显存 DMA |
+| **Game Boy Advance** | 在 [GBA 播放页](https://leehomn.github.io/gb-emu/gba-cpu/web/)选择本地 `.gba` 文件 | 独立的 Rust/Wasm 核心，已接入 ARM/Thumb、Mode 0–5、定时器、中断、DMA、声音和 SRAM/Flash/EEPROM 存档 |
 
-| 模块 | 内容 |
-|---|---|
-| CPU | SM83（类 Z80）主指令集 + CB 前缀位操作，取指/译码/执行循环 |
-| 中断 | VBlank / LCD / Timer / Serial / Joypad 五个向量，IME + IE/IF 逻辑 |
-| 定时器 | DIV + TIMA/TMA/TAC，按 TAC 分频累加、溢出回装 |
-| 串口 | 0xFF01/0xFF02，把测试 ROM 的 `ok` 结果吐到终端 |
-| PPU | **逐 dot（T-cycle）状态机**：37 个主状态 + 19 个取数状态 + 双 FIFO，BG/Window/OBJ 三层，含 SCX/SCY 滚动、图块映射、背景调色板切换毛刺、逐周期 OAM DMA、STAT 中断 |
-| MBC | MBC1/MBC3/MBC5 换页 + SRAM 存档 + RTC 寄存器（.sav 落盘 / 网页 localStorage） |
-| APU | 4 通道（方波×2 + 波形 + 噪声）+ 帧序列器，WAV 输出 / 网页 Web Audio |
-| 验证 | Blargg CPU 指令考卷 **75/75** + Mooneye MBC1 **13/13** + MBC5 **8/8** + cargo test **58 项单测 + 3 项 GBC 测试** + Mooneye OAM DMA **6/6** + Mealybug Tearoom **24/24** |
+GBA 网页支持键盘和触屏，声音通过「开启声音」打开。载入同一份 ROM 可恢复浏览器存档，也可以手动导入或导出 `.sav`。需要 BIOS 的卡带可在载入前选择自备文件。
 
-## 怎么跑
+## 第三方测试与回归
 
-### Rust 版（真代码）
+| 机型 | 测试 | 已记录结果 |
+| --- | --- | --- |
+| GB | Blargg CPU 指令 | **75/75** |
+| GB | Mooneye | MBC1 **13/13**，MBC5 **8/8**，OAM DMA **6/6** |
+| GB | [Mealybug Tearoom](https://github.com/mattcurrie/mealybug-tearoom-tests) | DMG 画面逐像素对比 **24/24** |
+| GBC | [cgb-acid2](https://github.com/mattcurrie/cgb-acid2) | **23,040 个像素**与参考图一致 |
+| GBA | [jsmolka ARM / Thumb](https://github.com/jsmolka/gba-tests) | 两个指令测试 ROM 均显示全部通过 |
+| GBA | [mGBA Test Suite](https://github.com/mgba-emu/suite) | 移位 **140/140**，进借位 **93/93**，长乘法 **72/72**，时序 **1726/2020**，内存 **1482/1552**，BIOS 数学 **603/615** |
+| GBA | [NanoBoyAdvance 显存时序 ROM](https://github.com/nba-emu/hw-test/tree/master/ppu/ram-access-timing) | 对 Mode 0、2–5 测了 **11 组配置**，每组 **1,231 个访问位置**，结果与参考模型一致 |
 
-```powershell
-# 环境：需要 Rust 工具链
-$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+GBA 最近一次整套回归通过 **102 项**。Tonc 示例和开源 Pong 已验证画面与输入。mGBA 套件使用开源替代 BIOS。Mode 1 混合背景通过了项目内的 CPU、DMA 和消隐边界用例，逐拍真机对照仍待完成。 [GBA 验证与复现步骤](./gba-cpu/README.md)
 
-# 跑 Blargg 考卷（75 个指令测试逐个打印 ok）
-cargo run --release -- roms/cpu_instrs.gb
+## 本地运行
 
-# 出截图
-cargo run --release -- roms/cpu_instrs.gb --screenshot exam.ppm
-
-# 单元测试
-cargo test
-```
-
-> 注意：`--play` 实时窗口用的是 minifb，在 Windows 上键盘事件收不到，**玩游戏请用网页版**。
-
-### 网页版（推荐玩）
-
-直接双击打开 `web/index.html`，点「▶玩 Adjustris」「▶玩 2048」或「▶玩扫雷」。
-
-- 方向键：移动
-- X：旋转 / 确认
-- Z：快速下落 / 返回
-- Enter：开始
-
-网页版是单文件 HTML，JS 版 Bus/Cpu/Ppu 逐行移植自 Rust 版，内置游戏 ROM 以 base64 内嵌。
-
-### 无头验证（Node）
+在仓库根目录运行 GB/GBC，命令里的 ROM 路径可换成自己的文件。GBA 使用独立的 Cargo 清单。
 
 ```powershell
-node verify_homebrew.js
+cargo test --locked
+cargo run --release --locked -- path/to/game.gb
+cargo test --locked --manifest-path gba-cpu/Cargo.toml
 ```
 
-跑 500 万条指令后检查 PPU 是否画出内容。
+第三方测试 ROM 和参考图的准备方式见 [GBA 测试说明](./gba-cpu/README.md) 和 [GB 项目复盘](./POSTMORTEM.md)。
 
-### Mealybug Tearoom Tests（PPU 时序考卷）
+| 路径 | 内容 |
+| --- | --- |
+| [`src/`](./src/) | GB/GBC 的 Rust 核心和命令行入口 |
+| [`web/`](./web/) 与 [`emulator/`](./emulator/) | GB/GBC 网页播放器和作品站使用的页面 |
+| [`gba-cpu/`](./gba-cpu/) | GBA 核心、测试、示例和网页播放器 |
+| [`index.html`](./index.html) | RustBoy 作品站首页 |
 
-24 张标准答案逐像素比对，DMG 套件 **24/24 通过**。
+## 开发路线
 
-```powershell
-# 前置：把测试 ROM 放进 _mealybug/extracted/、标准答案 PNG 放进 _mealybug/repo/expected/DMG-blob/
-# （这两处都被 .gitignore 挡着，需要自己从 https://github.com/mattcurrie/mealybug-tearoom-tests 取）
+1. **画面时序**。Mode 0–5 的背景显存等待已接入。接下来验证精灵争用、画到一半改寄存器的生效时刻，以及真机与参考模型的差异。
+2. **CPU 与内存**。继续按失败用例检查卡带预取、DMA 结束后的重新取指和内存边界。
+3. **整机与手机**。细化音频混音和 Flash 写入耗时，再分别验证实际手机上的触控、声音，以及更多卡带的启动、持续游玩和读档。
 
-# 一次跑全部 24 张
-python -X utf8 .\_mealybug\compare.py
-
-# 单张细看
-.\target\release\gb-emu.exe .\_mealybug\extracted\m3_scy_change.gb --mealybug .\_mealybug\out\m3_scy_change.raw
-python -X utf8 .\_mealybug\diff_rows.py m3_scy_change
-python -X utf8 .\_mealybug\ascii_diff.py m3_scy_change
-```
-
-这套测试比 Blargg 难得多：它专测「寄存器在一行渲染中途被改写」这类边界时序，需要 PPU 逐 dot 推进才能还原。旧版按扫描线整行渲染，一张都过不了。
-
-### Game Boy Color 模式
-
-加载带 CGB 标记的卡带时，桌面和网页自动选择彩色模式。支持背景、窗口、精灵调色板和优先级，显存及工作内存分区，双倍速切换，以及普通和 HBlank 显存 DMA。
-
-图形验证：[cgb-acid2](https://github.com/mattcurrie/cgb-acid2) 参考图 23,040 像素一致。黑白模式仍用 Mealybug DMG 套件回归。彩色模式的硬件边界时序、红外、串口通信和商业卡带兼容性尚未全面验证。
-
-## 目录结构
-
-```
-gb-emu/
-├── src/
-│   ├── lib.rs        # CPU（全指令集+CB）、总线、中断、定时器、串口、MBC、单元测试
-│   ├── ppu.rs        # PPU：逐 dot 状态机 + 双 FIFO + 取数器
-│   ├── apu.rs        # 音频（4 通道 + 帧序列器，WAV 输出）
-│   ├── main.rs       # CLI 入口（--screenshot / --play / --wav / --mealybug）
-│   └── wasm.rs       # C ABI 导出层（只在 wasm32 目标编译）
-├── web/
-│   └── index.html    # 网页版（单文件，可玩 5 款开源游戏）
-├── emulator/         # web/ 的副本，供展示站 iframe 载入
-├── index.html        # 作品展示站（RustBoy）
-├── roms/             # 测试 ROM（Blargg 考卷等）
-├── roms_mbc/         # Mooneye MBC1 考卷
-├── roms_mbc5/        # Mooneye MBC5 考卷
-├── roms_homebrew/    # 内置开源游戏 ROM（见「关于 ROM」）
-├── _mealybug/        # Mealybug 攻坚台（脚本入库，ROM/标准答案/参照实现不入库）
-├── verify_homebrew.js# 网页版无头验证脚本
-└── assets/img/       # 成果截图（exam.png / screen2048.png / screenminesweep.png）
-```
+[查看 GBA 整机路线图](./gba-cpu/ROADMAP.md)
 
 ## 关于 ROM
 
-- `roms/cpu_instrs.gb`、`roms/02-interrupts.gb` 等是 **Blargg 测试 ROM**（Shay Green 开源），可从 gbdev 官网下载。
+- GB 的 Blargg 测试使用单独准备的测试 ROM。[测试源码和构建产物](https://github.com/retrio/gb-test-roms)
 - 网页版内置的游戏均为**开源 / homebrew 作品**：
   - **Adjustris**（tbsp/Adjustris）—— CC0-1.0
   - **2048**（Sanqui/2048-gb）—— Zlib License
@@ -118,29 +65,3 @@ gb-emu/
   - **Tobu Tobu Girl**（tangramgames）—— MIT（代码）+ CC BY 4.0（素材），MBC1 换页
   - **Gigant Golf**（quinnyo/gbcompo2023）—— GPLv3（代码）+ CC BY-SA（素材），纯 32KB ROM
 - 商业游戏 ROM 受版权保护，**本仓库不包含、不传播**。请自备合法取得的 ROM 文件，用「📁 加载 ROM」自行载入。
-
-## 学习路线
-
-```
-CHIP-8（35 条指令，Python）
-  → Rust 语法
-  → GameBoy CPU 全指令集
-  → Blargg 考卷 75/75
-  → PPU 显像（BG + Window + OBJ + STAT 中断）
-  → MBC1 换页 + SRAM 存档（Mooneye 13 卷全过）
-  → MBC3/MBC5 换页 + RTC 寄存器（Mooneye MBC5 8 卷全过）
-  → APU 音频（4 通道 + 帧序列器）
-  → 网页版跑开源游戏（Adjustris / 2048 / 扫雷），能玩有声
-  → PPU 逐 dot 重写（Mealybug 时序考卷 24/24）
-```
-
-## 里程碑
-
-- [x] ① CPU 骨架：取指 / 译码 / 执行
-- [x] ② CPU 全指令集 + CB 前缀
-- [x] ③ Blargg 考卷 75/75
-- [x] ④ 显像：BG + Window + OBJ + STAT 中断，开源游戏可玩
-- [x] ⑤ 音频（APU 4 通道 + 帧序列器）
-- [x] ⑥ MBC1 换页 + SRAM 存档（Mooneye 13 卷全过）
-- [x] ⑦ MBC3/MBC5 换页 + RTC 寄存器（Mooneye MBC5 8 卷全过）
-- [x] ⑧ PPU 逐 dot 时序：Mealybug Tearoom DMG 套件 **24/24**
