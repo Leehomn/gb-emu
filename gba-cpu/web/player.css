@@ -1,10 +1,42 @@
 :root {
-  font-family: system-ui, "Microsoft YaHei", sans-serif;
-  color: #142435;
-  background: #edf2f5;
+  color-scheme: dark;
+  --bg: #07060f;
+  --bg-deep: #050409;
+  --surface: #12101f;
+  --surface-2: #1a1630;
+  --fg: #ece9fa;
+  --muted: #9a92b8;
+  --border: rgba(190, 170, 255, .13);
+  --border-strong: rgba(190, 170, 255, .34);
+  --accent: #00f0ff;
+  --accent-press: #53f5ff;
+  --neon-mag: #ff2ea6;
+  --shadow-hard: 6px 6px 0 rgba(8, 3, 20, .6);
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", sans-serif;
+  color: var(--fg);
+  background: var(--bg);
 }
 * { box-sizing: border-box; }
-body { margin: 0; }
+body {
+  min-height: 100vh;
+  margin: 0;
+  background: radial-gradient(1100px 520px at 12% -8%, rgba(84, 44, 178, .24), transparent 62%),
+    radial-gradient(900px 480px at 92% 2%, rgba(255, 46, 166, .11), transparent 60%),
+    radial-gradient(rgba(150, 130, 255, .08) 1px, transparent 1px) 0 0 / 20px 20px;
+}
+.site-bar { border-bottom: 1px solid var(--border); background: rgba(7, 6, 15, .86); }
+.site-bar nav {
+  width: min(1040px, 100% - 32px);
+  min-height: 64px;
+  margin: auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.site-bar a { color: var(--muted); text-decoration: none; font-weight: 650; }
+.site-bar a:hover, .site-bar .brand { color: var(--accent); }
+.brand { font-family: ui-monospace, Consolas, monospace; letter-spacing: .12em; }
 main {
   width: min(1040px, 100% - 32px);
   margin: 44px auto;
@@ -15,34 +47,46 @@ main {
 header { grid-column: 1 / -1; }
 h1 { margin: 0; font-size: clamp(26px, 5vw, 42px); }
 h2 { margin: 0 0 14px; font-size: 17px; }
-p { margin: 8px 0 0; color: #4b5f72; overflow-wrap: anywhere; }
-.game, aside { border: 1px solid #cedae3; border-radius: 14px; padding: 20px; }
-.game { background: #203244; }
-aside { background: #fff; align-self: start; line-height: 1.55; }
+p { margin: 8px 0 0; color: var(--muted); overflow-wrap: anywhere; }
+.game, aside {
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-hard);
+  min-width: 0;
+  padding: 20px;
+}
+aside { align-self: start; line-height: 1.55; }
 aside label { display: block; margin-bottom: 8px; }
 aside input { max-width: 100%; }
 aside p { margin: 12px 0 25px; }
-canvas { width: 100%; height: auto; display: block; background: #101b27; image-rendering: pixelated; border-radius: 6px; }
+canvas { width: 100%; height: auto; display: block; background: var(--bg-deep); image-rendering: pixelated; }
 .actions, .save { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
 button {
   padding: 9px 12px;
   min-height: 40px;
-  border: 1px solid #bbcad7;
-  border-radius: 7px;
-  background: #fff;
-  color: #142435;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  color: var(--fg);
   font: inherit;
   cursor: pointer;
 }
 button:disabled { opacity: .55; cursor: default; }
-button:focus-visible, canvas:focus-visible { outline: 3px solid #007fa3; outline-offset: 2px; }
-#open { background: #a6e8da; border-color: #a6e8da; font-weight: 650; }
+button:not(:disabled):hover { border-color: var(--accent); }
+:is(a, button, canvas, input):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+#open {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+  box-shadow: 4px 4px 0 var(--neon-mag);
+  font-weight: 700;
+}
+#open:not(:disabled):hover { background: var(--accent-press); }
 dl { margin: 0; }
-dl div { display: flex; justify-content: space-between; gap: 10px; border-top: 1px solid #dee7ed; padding: 8px 0; }
+dl div { display: flex; justify-content: space-between; gap: 10px; border-top: 1px solid var(--border); padding: 8px 0; }
 dd { margin: 0; text-align: right; }
 .controls { display: none; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; margin-top: 12px; }
 .controls button { touch-action: none; user-select: none; padding: 6px 2px; }
-.controls button:active { background: #a6e8da; }
+.controls button:active { background: var(--accent); color: var(--bg); }
 @media (max-width: 720px) {
   main { margin: 24px auto; grid-template-columns: minmax(0, 1fr); }
   .game, aside { padding: 12px; }

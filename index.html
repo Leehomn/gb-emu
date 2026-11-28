@@ -379,6 +379,8 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
 .play-error p{margin:0;color:var(--muted);font-size:14px;max-width:38ch;}
 .play-error code{font-size:10px;color:var(--accent);}
 .play-note{max-width:560px;margin:14px auto 0;font-size:13px;color:var(--muted);text-align:center;}
+.gba-play{max-width:560px;margin:36px auto 0;}
+.gba-play .gba-actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:18px;}
 .noscript-note{color:var(--danger);text-align:center;font-size:14px;margin:14px 0 0;}
 
 /* ============================================================
@@ -576,7 +578,7 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
       <header class="section-head reveal">
         <p class="eyebrow">PLAY · 游玩区</p>
         <h2>插上卡带，开玩</h2>
-        <p class="section-sub">内嵌模拟器网页版（单文件 HTML，JS 内核逐行移植自 Rust 版）。点击启动，无需安装任何东西。</p>
+        <p class="section-sub">GB 和 GBC 可在本页启动，GBA 可打开独立播放器。三种机型都能在浏览器里游玩。</p>
       </header>
 
       <div class="screen-frame reveal" data-od-id="play-frame">
@@ -613,7 +615,16 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
         </div>
       </div>
 
-      <p class="play-note">键盘：方向键移动 · X=A · Z=B · Enter=Start（与模拟器页内说明一致）；手机端会自动显示十字键与 A/B/S 按钮，也可点「全屏」游玩。</p>
+      <p class="play-note">GB / GBC 键盘：方向键移动 · X=A · Z=B · Enter=Start（与模拟器页内说明一致）；手机端会自动显示十字键与 A/B/S 按钮，也可点「全屏」游玩。</p>
+      <article class="tech-card gba-play reveal" aria-labelledby="gba-play-title">
+        <span class="tag">GAME BOY ADVANCE</span>
+        <h3 id="gba-play-title">GBA 播放器</h3>
+        <p>载入自己的 .gba 卡带，使用键盘或触屏游玩。支持声音、自动保存和存档导入导出。</p>
+        <div class="gba-actions">
+          <a class="btn btn-primary" href="./gba-cpu/web/">打开 GBA 播放器</a>
+          <a class="btn btn-ghost" href="https://github.com/Leehomn/gb-emu/tree/master/gba-cpu">查看 GBA 实现</a>
+        </div>
+      </article>
       <p class="play-legal">※ 本站仅内置自制 / 免费 ROM，不提供任何商业游戏 ROM；商业 ROM 请自备。</p>
     </div>
   </section>
@@ -693,7 +704,7 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
       <header class="section-head reveal">
         <p class="eyebrow">JOURNEY · 学习路线</p>
         <h2>从 CHIP-8 到第一块砖</h2>
-        <p class="section-sub">从 CHIP-8 入门机一路打通到 Game Boy 的像素世界——每一站都真实走过。</p>
+        <p class="section-sub">从 CHIP-8 入门，再到 GB、GBC 和 GBA。每一站都接着上一站，解决一组新的硬件问题。</p>
       </header>
 
       <ol class="timeline">
@@ -721,11 +732,23 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
           <h3>Blargg 考卷：75/75</h3>
           <p>社区公认的指令级考卷，从第一题做到 75/75 全部通过——核心逻辑拿到「合格证」，才敢往下接屏幕。</p>
         </li>
-        <li class="tl-item lit reveal">
+        <li class="tl-item reveal">
           <span class="tl-node" aria-hidden="true"></span>
           <span class="tl-tag">STAGE 05</span>
           <h3>PPU 显像：第一块砖落下</h3>
           <p>每帧 70,224 个时钟周期、每秒 59.7 帧的节奏，逐行画满 160×144——屏幕亮起那一刻，2048 的数字方块落在自己写的机器上。</p>
+        </li>
+        <li class="tl-item reveal">
+          <span class="tl-node" aria-hidden="true"></span>
+          <span class="tl-tag">STAGE 06</span>
+          <h3>Game Boy Color：从黑白到彩色</h3>
+          <p>加入彩色调色板、显存分区和双倍速。cgb-acid2 测试图与参考图逐像素一致。</p>
+        </li>
+        <li class="tl-item lit reveal">
+          <span class="tl-node" aria-hidden="true"></span>
+          <span class="tl-tag">STAGE 07</span>
+          <h3>Game Boy Advance：从指令到整机</h3>
+          <p>从 ARM 和 Thumb 指令起步，接入画面、声音和存档。现在用公开测试卡带检查显示芯片、CPU 和 DMA 同时访问显存时的行为。</p>
         </li>
       </ol>
     </div>
