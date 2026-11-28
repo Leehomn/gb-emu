@@ -11,10 +11,12 @@
   <title>GBA 播放器 · RustBoy</title>
 </head>
 <body>
+  <canvas id="matrix-bg" aria-hidden="true"></canvas>
   <div class="site-bar">
     <nav aria-label="站点导航">
       <a class="brand" href="../../">RustBoy</a>
       <a href="../../#play">返回游玩区</a>
+      <button id="rain-toggle" type="button" aria-pressed="true" aria-label="切换背景代码雨">RAIN: ON</button>
     </nav>
   </div>
   <main>
@@ -62,5 +64,71 @@
       </dl>
     </aside>
   </main>
+<script>
+/* 背景代码雨独立运行，不接入模拟器逻辑。 */
+(function () {
+  'use strict';
+  const canvas = document.getElementById('matrix-bg');
+  const button = document.getElementById('rain-toggle');
+  const ctx = canvas.getContext('2d');
+  if (!ctx) { button.hidden = true; return; }
+  const motion = window.matchMedia('(prefers-reduced-motion: reduce)');
+  const glyphs = 'ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ0123456789ABCDEF';
+  let enabled = true, raf = 0, last = 0, width = 0, height = 0, size = 18, drops = [];
+  try { enabled = localStorage.getItem('rustboy-matrix-rain') !== 'off'; } catch (_) { /* 隐私模式下使用默认值 */ }
+  function symbol() { return Math.random() < .003 ? ['LD', 'IRQ', 'DMA'][Math.floor(Math.random()*3)] : glyphs[Math.floor(Math.random()*glyphs.length)]; }
+  function paint(still) {
+    ctx.fillStyle = still ? '#07060f' : 'rgba(7,6,15,.09)';
+    ctx.fillRect(0, 0, width, height);
+    ctx.font = size + 'px ui-monospace, Consolas, monospace';
+    drops.forEach(function (drop, i) {
+      const x = i * size, y = drop.y;
+      if (still) {
+        for (let j = 1; j < 13; j++) {
+          ctx.fillStyle = 'rgba(0,255,136,' + (.34 * (1-j/13)) + ')';
+          ctx.fillText(symbol(), x, y-j*size);
+        }
+      }
+      ctx.fillStyle = i % 47 === 0 ? '#ff2ea6' : i % 29 === 0 ? '#00f0ff' : '#14f195';
+      ctx.fillText(symbol(), x, y-size);
+      ctx.fillStyle = i % 3 === 0 ? '#00f0ff' : '#d8fff4';
+      ctx.fillText(symbol(), x, y);
+      if (!still) { drop.y += size * drop.speed; if (drop.y > height + size*15 && Math.random() > .975) drop.y = -size; }
+    });
+  }
+  function tick(time) {
+    raf = 0;
+    if (!enabled || document.hidden || motion.matches) return;
+    if (time-last >= 50) { paint(false); last = time; }
+    raf = requestAnimationFrame(tick);
+  }
+  function sync() {
+    if (raf) { cancelAnimationFrame(raf); raf = 0; }
+    button.textContent = 'RAIN: ' + (enabled ? 'ON' : 'OFF');
+    button.setAttribute('aria-pressed', String(enabled));
+    canvas.hidden = !enabled;
+    if (enabled && !document.hidden) { if (motion.matches) paint(true); else raf = requestAnimationFrame(tick); }
+  }
+  function resize() {
+    width = window.innerWidth; height = window.innerHeight;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(width*dpr); canvas.height = Math.round(height*dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    size = width < 600 ? 20 : 18;
+    drops = Array.from({length: Math.ceil(width/size)}, function () { return { y: Math.random()*height, speed: .35+Math.random()*.65 }; });
+    ctx.clearRect(0, 0, width, height);
+    sync();
+  }
+  button.addEventListener('click', function () {
+    enabled = !enabled;
+    try { localStorage.setItem('rustboy-matrix-rain', enabled ? 'on' : 'off'); } catch (_) { /* 存储不可用时仍可切换 */ }
+    sync();
+  });
+  window.addEventListener('resize', resize);
+  document.addEventListener('visibilitychange', sync);
+  motion.addEventListener('change', sync);
+  resize();
+})();
+</script>
 </body>
 </html>

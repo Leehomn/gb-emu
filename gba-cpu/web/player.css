@@ -59,7 +59,7 @@ aside { align-self: start; line-height: 1.55; }
 aside label { display: block; margin-bottom: 8px; }
 aside input { max-width: 100%; }
 aside p { margin: 12px 0 25px; }
-canvas { width: 100%; height: auto; display: block; background: var(--bg-deep); image-rendering: pixelated; }
+#screen { width: 100%; height: auto; display: block; background: var(--bg-deep); image-rendering: pixelated; }
 .actions, .save { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
 button {
   padding: 9px 12px;
@@ -72,7 +72,7 @@ button {
 }
 button:disabled { opacity: .55; cursor: default; }
 button:not(:disabled):hover { border-color: var(--accent); }
-:is(a, button, canvas, input):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+:is(a, button, #screen, input):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 #open {
   background: var(--accent);
   border-color: var(--accent);
@@ -94,3 +94,24 @@ dd { margin: 0; text-align: right; }
 @media (pointer: coarse), (max-width: 720px) {
   .controls { display: grid; }
 }
+
+/* 赛博外壳；触屏按键及游戏画布的尺寸和按键映射保持原样。 */
+:root{--surface:rgba(12,10,26,.84);--muted:#b9b2ce;--border:rgba(0,255,136,.18);}
+[hidden]{display:none!important;}
+#matrix-bg{position:fixed;inset:0;z-index:0;pointer-events:none;width:100%;height:100%;opacity:.48;background:transparent;}
+main{position:relative;z-index:2;}
+.site-bar{position:relative;z-index:3;background:rgba(12,10,26,.9);backdrop-filter:blur(8px);border-bottom-color:rgba(0,240,255,.4);}
+.site-bar nav{flex-wrap:wrap;padding:10px 0;}.site-bar #rain-toggle{margin-left:auto;font:12px ui-monospace,Consolas,monospace;color:#14f195;}
+main>header,.game,aside{background:rgba(12,10,26,.84);backdrop-filter:blur(8px);border:1px solid var(--border-strong);box-shadow:0 0 24px rgba(0,240,255,.06);}
+main>header{padding:20px;border-left:2px solid #14f195;}
+h1{text-shadow:1px 0 rgba(255,46,166,.4),-1px 0 rgba(0,240,255,.4);}
+.game,aside{border-top-color:rgba(0,240,255,.55);border-bottom-color:rgba(255,46,166,.4);clip-path:polygon(0 0,calc(100% - 10px) 0,100% 10px,100% 100%,10px 100%,0 calc(100% - 10px));}
+#screen{position:relative;z-index:1;outline:1px solid rgba(0,255,136,.3);outline-offset:3px;}
+button{clip-path:polygon(0 0,calc(100% - 6px) 0,100% 6px,100% 100%,6px 100%,0 calc(100% - 6px));transition:background-color .15s,box-shadow .15s;}
+button:not(:disabled):hover{box-shadow:inset 0 0 14px rgba(0,240,255,.15);}
+button:not(:disabled):active,button[aria-pressed="true"]{border-color:#14f195;background:rgba(0,255,136,.12);}
+.controls button{min-height:48px;}.controls button:active{background:#14f195;color:#07060f;box-shadow:0 0 16px rgba(0,255,136,.3);}
+body::after{content:'';position:fixed;inset:0;z-index:4;pointer-events:none;background:repeating-linear-gradient(transparent 0 3px,rgba(0,0,0,.08) 3px 4px);}
+@media(max-width:380px){.site-bar nav{gap:8px;}.site-bar a{font-size:13px;}.site-bar #rain-toggle{font-size:11px;padding:8px;}}
+@media(prefers-reduced-motion:reduce){button{transition:none;}}
+@media print{#matrix-bg{display:none;}}

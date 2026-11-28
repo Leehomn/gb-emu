@@ -3,12 +3,12 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>RustBoy · 用 Rust 从零写的 Game Boy 模拟器</title>
-<meta name="description" content="用 Rust 从零实现的 Game Boy 模拟器：CPU、中断、定时器、PPU 全部手写，Blargg 指令测试 75/75 通过，打开网页就能玩 2048 和扫雷。">
+<title>RustBoy · 用 Rust 从零写 GB、GBC 和 GBA 模拟器</title>
+<meta name="description" content="用 Rust 从零实现 GB、GBC 和 GBA 模拟器：逐周期画面、彩色图层、ARM/Thumb、声音与卡带存档，三个机型均可在浏览器运行。GBA 正在完善时序精度与兼容性。">
 <meta name="theme-color" content="#07060f">
 <meta name="color-scheme" content="dark">
-<meta property="og:title" content="RustBoy · 用 Rust 从零写的 Game Boy 模拟器">
-<meta property="og:description" content="CPU、中断、定时器、PPU 全部手写，Blargg 75/75 通过——浏览器里直接玩 2048 和扫雷。">
+<meta property="og:title" content="RustBoy · 用 Rust 从零写 GB、GBC 和 GBA 模拟器">
+<meta property="og:description" content="用 Rust 从零实现 GB、GBC 和 GBA 模拟器：逐周期画面、彩色图层、ARM/Thumb、声音与卡带存档，三个机型均可在浏览器运行。GBA 正在完善时序精度与兼容性。">
 <meta property="og:type" content="website">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='3' y='1' width='10' height='9' fill='%239bbc0f'/%3E%3Crect x='3' y='4' width='10' height='4' fill='%23306230'/%3E%3Crect x='2' y='10' width='12' height='3' fill='%23dfe8d8'/%3E%3Crect x='4' y='13' width='8' height='2' fill='%238fa08c'/%3E%3C/svg%3E">
 <script>document.documentElement.classList.add('js');</script>
@@ -338,12 +338,12 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
   font-size:13px;color:var(--muted);
 }
 .screen-frame{
-  max-width:560px;margin:0 auto;
+  max-width:680px;margin:0 auto;
   background:var(--surface);
   border:2px solid var(--border-strong);
   box-shadow:var(--shadow-hard),0 0 26px rgba(0,240,255,.1),0 0 64px rgba(178,107,255,.12);
 }
-.screen-stage{position:relative;aspect-ratio:10/9;background:var(--bg-deep);overflow:hidden;}
+.screen-stage{position:relative;aspect-ratio:auto;height:680px;background:var(--bg-deep);overflow:hidden;}
 .screen-stage iframe{
   position:absolute;inset:0;width:100%;height:100%;border:0;background:#000;
 }
@@ -467,7 +467,6 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
 }
 @media (max-width:560px){
   .container{padding:0 18px;}
-  .screen-stage{aspect-ratio:auto;height:540px;}
   .hero-cta .btn{flex:1 1 auto;}
   .hero-stats{flex-direction:column;}
   .hero-stats>div+div{border-left:0;border-top:2px solid var(--border);}
@@ -495,9 +494,35 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
   .site-header,.hero-cta{display:none;}
   body{background:#fff;color:#111;}
 }
+
+/* 赛博玻璃与 Matrix 背景：内容及控件始终处于背景之上。 */
+:root{--surface:rgba(12,10,26,.84);--muted:#b9b2ce;--border:rgba(0,255,136,.16);--container:1200px;}
+#matrix-bg{position:fixed;inset:0;z-index:0;pointer-events:none;width:100%;height:100%;opacity:.5;}
+main,footer{position:relative;z-index:2;}
+body::before{z-index:3;opacity:.17;}body::after{z-index:1;opacity:.06;}
+.nav{height:auto;min-height:72px;gap:16px;flex-wrap:wrap;padding-top:12px;padding-bottom:12px;}
+.sys-status{font:10px ui-monospace,Consolas,monospace;color:#14f195;letter-spacing:.04em;}
+.nav-links a{padding:8px 9px;}.nav-tools{display:flex;align-items:center;gap:14px;}.nav-tools a,.text-link,.doc-links a,.bench-note a{color:var(--accent);text-decoration:none;font-size:13px;}
+.hero-grid{grid-template-columns:minmax(0,1.6fr) minmax(260px,.75fr);gap:36px;}.hero h1{font-size:clamp(28px,3.3vw,44px);text-shadow:1px 0 rgba(255,46,166,.28),-1px 0 rgba(0,240,255,.26);}
+.hero-copy{padding:22px;background:rgba(12,10,26,.84);backdrop-filter:blur(8px);border-left:2px solid rgba(0,255,136,.55);}.hero .eyebrow{font-size:9px;line-height:2;letter-spacing:.1em;}
+.hero-cta{gap:12px;}.hero-cta .btn{font-size:13px;padding:12px 16px;letter-spacing:.03em;}.hero-stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));margin-top:26px;}.hero-stats>div{padding:15px 12px;}.hero-stats>div+div{border:0;}.hero-stats>div:nth-child(even){border-left:1px solid var(--border);}.hero-stats>div:nth-child(n+3){border-top:1px solid var(--border);}.hero-stats dt{font-size:clamp(12px,1.4vw,16px);}
+.dmg-shell{background:linear-gradient(145deg,rgba(25,20,50,.9),rgba(8,18,27,.86));border-color:rgba(0,240,255,.55);backdrop-filter:blur(8px);box-shadow:12px 12px 0 rgba(8,3,20,.6),inset 0 0 26px rgba(0,240,255,.08),0 0 45px rgba(0,255,136,.13),-4px 0 30px rgba(255,46,166,.12);}
+.section-head{background:rgba(12,10,26,.84);backdrop-filter:blur(8px);padding:24px;border-left:2px solid var(--accent);max-width:760px;}
+.machine-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px;margin-bottom:36px;}.text-link{display:inline-block;margin-top:18px;}.tech-grid{grid-template-columns:repeat(3,minmax(0,1fr));}
+.tech-card,.terminal,.matrix-table,.screen-frame{background:rgba(12,10,26,.84);backdrop-filter:blur(8px);}.tech-card,.terminal{clip-path:polygon(0 0,calc(100% - 14px) 0,100% 14px,100% 100%,14px 100%,0 calc(100% - 14px));}
+.btn,.btn-mini{clip-path:polygon(0 0,calc(100% - 8px) 0,100% 8px,100% 100%,8px 100%,0 calc(100% - 8px));}.screen-frame{position:relative;padding:10px;max-width:680px;}.screen-frame::after{content:'';position:absolute;inset:-4px;pointer-events:none;background:linear-gradient(#00f0ff,#00f0ff) left top/22px 2px no-repeat,linear-gradient(#00f0ff,#00f0ff) left top/2px 22px no-repeat,linear-gradient(#14f195,#14f195) right top/22px 2px no-repeat,linear-gradient(#14f195,#14f195) right top/2px 22px no-repeat,linear-gradient(#14f195,#14f195) left bottom/22px 2px no-repeat,linear-gradient(#14f195,#14f195) left bottom/2px 22px no-repeat,linear-gradient(#ff2ea6,#ff2ea6) right bottom/22px 2px no-repeat,linear-gradient(#ff2ea6,#ff2ea6) right bottom/2px 22px no-repeat;}
+.play-legal{max-width:900px;line-height:1.9;}.matrix-table{overflow-x:auto;border:1px solid var(--border-strong);}.matrix-table table{width:100%;border-collapse:collapse;font-size:14px;}.matrix-table caption{text-align:left;padding:14px 18px;color:#14f195;font:12px ui-monospace,Consolas,monospace;background:rgba(0,255,136,.05);}.matrix-table th,.matrix-table td{padding:16px 18px;text-align:left;border-bottom:1px solid var(--border);vertical-align:top;}.matrix-table thead{color:var(--accent);}.matrix-table tbody th{font-weight:500;}.matrix-table tr:hover{background:rgba(0,240,255,.06);}.matrix-table strong{color:#14f195;font-family:ui-monospace,Consolas,monospace;}.matrix-table small{color:var(--muted);}.bench-note{background:var(--surface);padding:18px;font-size:13px;color:var(--muted);}
+.timeline{background:var(--surface);padding-top:24px;padding-bottom:12px;backdrop-filter:blur(8px);}.next-title{margin-top:44px;color:#14f195;}.terminal{border:1px solid var(--border-strong);padding:24px;}.terminal pre{overflow-x:auto;color:#14f195;}.terminal code{font:13px/2 ui-monospace,Consolas,monospace;letter-spacing:0;}.doc-links{display:flex;flex-wrap:wrap;gap:20px;}.site-footer{background:rgba(12,10,26,.92);}
+@media(max-width:1000px){.sys-status{display:none;}.hero-grid{grid-template-columns:minmax(0,1fr) 280px;gap:20px;}.tech-grid{grid-template-columns:repeat(2,minmax(0,1fr));}}
+@media(max-width:760px){.screen-stage{height:610px;}html{scroll-padding-top:150px;}.nav{gap:8px;}.nav-links{order:3;width:100%;justify-content:center;}.nav-tools{margin-left:auto;}.hero-grid{grid-template-columns:minmax(0,1fr);gap:40px;}.hero{padding:44px 0 60px;}.machine-grid,.tech-grid{grid-template-columns:minmax(0,1fr);}.hero-copy{padding:20px;}.hero-stats{grid-template-columns:repeat(2,minmax(0,1fr));}.matrix-table th,.matrix-table td{padding:10px 8px;}.matrix-table{font-size:13px;}.matrix-table table{width:100%;font-size:12.5px;}.matrix-table td:first-child{white-space:nowrap;}.brand-name{display:inline;}.nav-tools a{font-size:12px;}}
+@media(max-width:380px){.container{padding-left:14px;padding-right:14px;}.brand{font-size:10px;gap:6px;}.nav-tools{gap:8px;}.btn-mini{padding:8px;}.hero-copy{padding:14px;}.hero h1{font-size:26px;}.hero-stats dt{font-size:11px;}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;}.tech-card:hover{transform:none;}}
+@media print{#matrix-bg{display:none;}}
+
 </style>
 </head>
 <body>
+<canvas id="matrix-bg" aria-hidden="true"></canvas>
 
 <a class="skip-link" href="#main">跳到主要内容</a>
 
@@ -512,12 +537,15 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
       </svg>
       <span class="brand-name">RUSTBOY</span>
     </a>
+    <span class="sys-status">SYS:ONLINE // GB·GBC·GBA</span>
     <ul class="nav-links">
       <li><a href="#home">首页</a></li>
       <li><a href="#play">游玩</a></li>
+      <li><a href="#bench">实测</a></li>
       <li><a href="#tech">技术</a></li>
       <li><a href="#path">路线</a></li>
     </ul>
+    <div class="nav-tools"><button class="btn-mini" id="rain-toggle" type="button" aria-pressed="true" aria-label="切换背景代码雨">RAIN: ON</button><a href="./gba-cpu/web/">GBA 播放器 ↗</a></div>
   </nav>
 </header>
 
@@ -527,25 +555,25 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
   <section id="home" class="hero" data-od-id="hero">
     <div class="container hero-grid">
       <div class="hero-copy">
-        <p class="eyebrow reveal">RUST · GAME BOY EMULATOR</p>
-        <h1 class="reveal">用 Rust，从零写<br>一台 Game Boy。</h1>
-        <p class="hero-sub reveal">核心全部手写——CPU、中断、定时器、PPU 一块块拼起来，
-          <b>Blargg 指令测试 75/75 通过</b>。现在，它在浏览器里跑开源游戏 2048 和扫雷。</p>
+        <p class="eyebrow reveal">RUST · WASM · GB / GBC / GBA EMULATOR</p>
+        <h1 class="reveal">用 Rust，从零写一台<br>GB · GBC · GBA 掌机内核。</h1>
+        <p class="hero-sub reveal">从 Python 写 CHIP-8 的取指循环开始，用 Rust 实现 Game Boy 的 CPU、逐周期画面、声音与卡带；接入 Game Boy Color 彩色图层与双倍速；再从 ARM/Thumb 指令起步做 Game Boy Advance。现在三个机型都能在浏览器里直接运行。</p>
         <div class="hero-cta reveal">
           <a class="btn btn-primary" href="#play">
             <svg width="13" height="13" viewBox="0 0 12 12" aria-hidden="true" shape-rendering="crispEdges"><path d="M2 1 L10 6 L2 11 Z" fill="currentColor"/></svg>
             立即游玩
           </a>
-          <a class="btn btn-ghost" href="#tech">机器怎么造 →</a>
+          <a class="btn btn-ghost" href="./gba-cpu/web/">打开 GBA 播放器</a><a class="btn btn-ghost" href="#tech">技术与考卷</a>
         </div>
         <dl class="hero-stats reveal">
-          <div><dt>75/75</dt><dd>Blargg 指令测试通过</dd></div>
-          <div><dt>160×144</dt><dd>PPU 渲染分辨率</dd></div>
-          <div><dt>1 FILE</dt><dd>单文件网页版，零安装</dd></div>
+          <div><dt>75/75</dt><dd>Blargg GB CPU 指令测试</dd></div>
+          <div><dt>24/24</dt><dd>Mealybug DMG 逐像素对比</dd></div>
+          <div><dt>23,040 px</dt><dd>cgb-acid2 GBC 彩色对齐</dd></div>
+          <div><dt>102 PASS</dt><dd>GBA 最近整套回归；显存时序见实测</dd></div>
         </dl>
       </div>
 
-      <figure class="dmg reveal" role="img" aria-label="用 CSS 绘制的灰色 Game Boy 掌机，屏幕位置预留给 2048 运行截图">
+      <figure class="dmg reveal" role="img" aria-label="用 CSS 绘制的赛博夜光 Game Boy 掌机，屏幕显示 2048 运行截图">
         <div class="dmg-shell">
           <div class="dmg-bezel">
             <div class="dmg-bezel-top"><span>DOT MATRIX WITH STEREO SOUND</span></div>
@@ -581,6 +609,11 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
         <p class="section-sub">GB 和 GBC 可在本页启动，GBA 可打开独立播放器。三种机型都能在浏览器里游玩。</p>
       </header>
 
+<div class="machine-grid">
+  <article class="tech-card reveal"><p class="tag">01 / GB</p><h3>Game Boy (DMG)</h3><p>内置 5 款开源作品：Adjustris、2048、扫雷、Tobu Tobu Girl、Gigant Golf。支持自选 .gb ROM、MBC1/3/5 与 RTC 存档。</p><a class="text-link" href="#playStage">启动下方播放器 ↓</a></article>
+  <article class="tech-card reveal"><p class="tag">02 / GBC</p><h3>Game Boy Color</h3><p>同一播放器载入带 CGB 标记的卡带，自动切换彩色模式。支持彩色图层、显存/工作内存分区、双倍速及普通/HBlank 显存 DMA。</p><a class="text-link" href="#playStage">载入自己的彩色卡带 ↓</a></article>
+  <article class="tech-card reveal"><p class="tag">03 / GBA</p><h3>Game Boy Advance</h3><p>独立 Rust/Wasm 核心：ARM/Thumb、Mode 0–5、定时器、中断、DMA、32,768 Hz 立体声、SRAM/Flash/EEPROM，支持 .sav 导入导出与可选 16 KiB BIOS。</p><a class="text-link" href="./gba-cpu/web/">打开 GBA 播放器 ↗</a></article>
+</div>
       <div class="screen-frame reveal" data-od-id="play-frame">
         <div class="screen-stage" id="playStage">
           <div class="play-cover" id="playCover">
@@ -616,148 +649,49 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
       </div>
 
       <p class="play-note">GB / GBC 键盘：方向键移动 · X=A · Z=B · Enter=Start（与模拟器页内说明一致）；手机端会自动显示十字键与 A/B/S 按钮，也可点「全屏」游玩。</p>
-      <article class="tech-card gba-play reveal" aria-labelledby="gba-play-title">
-        <span class="tag">GAME BOY ADVANCE</span>
-        <h3 id="gba-play-title">GBA 播放器</h3>
-        <p>载入自己的 .gba 卡带，使用键盘或触屏游玩。支持声音、自动保存和存档导入导出。</p>
-        <div class="gba-actions">
-          <a class="btn btn-primary" href="./gba-cpu/web/">打开 GBA 播放器</a>
-          <a class="btn btn-ghost" href="https://github.com/Leehomn/gb-emu/tree/master/gba-cpu">查看 GBA 实现</a>
-        </div>
-      </article>
-      <p class="play-legal">※ 本站仅内置自制 / 免费 ROM，不提供任何商业游戏 ROM；商业 ROM 请自备。</p>
+
+      <p class="play-legal">开源 ROM：Adjustris（CC0-1.0）· 2048（Zlib）· 扫雷（GPL-3.0）· Tobu Tobu Girl（代码 MIT + 素材 CC BY 4.0）· Gigant Golf（代码 GPLv3 + 素材 CC BY-SA）。本站不提供、不传播商业 ROM，请自备合法取得的文件。</p>
     </div>
   </section>
 
-  <!-- ========== 技术亮点 ========== -->
-  <section id="tech" class="section" data-od-id="tech">
-    <div class="container">
-      <header class="section-head reveal">
-        <p class="eyebrow">TECH · 技术亮点</p>
-        <h2>四个模块，一台主机</h2>
-        <p class="section-sub">不用现成模拟器框架，核心逻辑逐个模块手写。</p>
-      </header>
+<section id="bench" class="section"><div class="container">
+<header class="section-head reveal"><p class="eyebrow">VERIFICATION MATRIX · 第三方考卷与实测</p><h2>每一个成绩，都有考卷。</h2><p class="section-sub">以下为仓库已记录的验证结果，不代表所有卡带兼容。</p></header>
+<div class="matrix-table reveal"><table><caption>GB / GBC / GBA 已记录验证矩阵</caption><thead><tr><th scope="col">机型</th><th scope="col">测试</th><th scope="col">已记录结果</th></tr></thead><tbody><tr><td>GB</td><th scope="row">Blargg CPU 指令</th><td><strong>75/75</strong></td></tr>
+<tr><td>GB</td><th scope="row">Mooneye</th><td>MBC1 <strong>13/13</strong> · MBC5 <strong>8/8</strong> · OAM DMA <strong>6/6</strong></td></tr>
+<tr><td>GB</td><th scope="row">Mealybug Tearoom</th><td>DMG 画面逐像素对比 <strong>24/24</strong></td></tr>
+<tr><td>GBC</td><th scope="row">cgb-acid2</th><td><strong>23,040 个像素</strong>与参考图一致</td></tr>
+<tr><td>GBA</td><th scope="row">jsmolka ARM / Thumb</th><td>两个指令测试 ROM 均显示全部通过</td></tr>
+<tr><td>GBA</td><th scope="row">mGBA Test Suite</th><td>移位 <strong>140/140</strong> · 进借位 <strong>93/93</strong> · 长乘法 <strong>72/72</strong><br>时序 <strong>1726/2020</strong> · 内存 <strong>1482/1552</strong> · BIOS 数学 <strong>603/615</strong><br><small>使用开源替代 BIOS；仍有未通过项。</small></td></tr>
+<tr><td>GBA</td><th scope="row">NanoBoyAdvance 显存时序 ROM</th><td>Mode 0、2–5：<strong>11 组配置</strong>，每组 <strong>1,231 个访问位置</strong>与参考模型一致</td></tr>
+<tr><td>GBA</td><th scope="row">整套回归与整机示例</th><td>最近一次整套回归通过 <strong>102 项</strong>；Tonc 示例与开源 Pong 已验证画面与输入</td></tr></tbody></table></div>
+<p class="bench-note">Mode 1 混合背景已通过项目内 CPU、DMA 和消隐边界用例，逐拍真机对照仍待完成。显存时序结果来自模拟器与参考模型对比；实际手机及商业卡带兼容性仍待验证。<a href="https://github.com/Leehomn/gb-emu/blob/master/gba-cpu/README.md">验证与复现步骤 ↗</a></p>
+</div></section>
+<section id="tech" class="section" data-od-id="tech"><div class="container"><header class="section-head reveal"><p class="eyebrow">TECH · 三世代核心架构</p><h2>六个模块，接起三代掌机。</h2><p class="section-sub">用同一条取指循环，逐步走到画面、声音和整机时序。</p></header><div class="tech-grid"><article class="tech-card reveal"><p class="tag">GB · CPU</p><h3>LR35902 (SM83) 处理器</h3><p>主指令集与 CB 前缀位操作，逐条实现取指、译码和执行，对齐 Z / N / H / C 标志位。Blargg CPU 指令测试 75/75。</p><div class="card-bottom"><figure class="shot"><img src="assets/img/exam.png" alt="Blargg 指令测试画面" loading="lazy" data-slot><figcaption class="slot-hint">等待放入截图<code>assets/img/exam.png</code></figcaption></figure></div></article>
+<article class="tech-card reveal"><p class="tag">GB · PPU</p><h3>逐 Dot 状态机图像引擎</h3><p>逐周期推进背景与精灵取数，处理图块、调色板和 OAM DMA。Mealybug DMG 逐像素对比 24/24，Mooneye OAM DMA 6/6。</p><div class="card-bottom"><figure class="shot"><img src="assets/img/screenminesweep.png" alt="PPU 渲染的扫雷画面" loading="lazy" data-slot><figcaption class="slot-hint">等待放入截图<code>assets/img/screenminesweep.png</code></figcaption></figure></div></article>
+<article class="tech-card reveal"><p class="tag">GB · IRQ & TIMER</p><h3>中断与定时器总线</h3><p>VBlank / LCD / Timer / Serial / Joypad 五个中断向量统一调度，IME 与 IE/IF 控制请求；DIV、TIMA/TMA/TAC 负责分频、溢出回装与定时中断。</p><div class="card-bottom"><div class="reg"><b>IE</b> @ $FFFF · <b>IF</b> @ $FF0F<br>DIV @ $FF04 · TIMA @ $FF05<br>TMA @ $FF06 · TAC @ $FF07<br>中断向量 $40–$60 · IME</div></div></article>
+<article class="tech-card reveal"><p class="tag">GB · APU & MBC</p><h3>四声道音频与卡带存档</h3><p>四声道音频采用去直流混音；MBC1/3/5 支持卡带换页与 SRAM 存档，MBC3 RTC 按墙钟推进。</p></article>
+<article class="tech-card reveal"><p class="tag">GBC · CGB</p><h3>从四阶绿到彩色图层</h3><p>彩色背景与精灵、显存和工作内存分区、双倍速切换、普通与 HBlank 显存 DMA。cgb-acid2 的 23,040 px 与参考图逐像素一致。</p></article>
+<article class="tech-card reveal"><p class="tag">GBA · ARM7TDMI</p><h3>ARM/Thumb 与整机总线</h3><p>ARM/Thumb 两级预取、WAITCNT 八半字缓冲、Mode 0–5 扫描线分段与背景显存争用、DMA0–3、32,768 Hz 立体声，以及 SRAM/Flash/EEPROM。精灵争用、寄存器锁存与部分时序仍待细化。</p></article></div></div></section>
 
-      <div class="tech-grid">
-        <article class="tech-card reveal" data-od-id="tech-cpu">
-          <p class="tag">CPU</p>
-          <h3>LR35902 处理器</h3>
-          <p>SM83（类 Z80）主指令集 + CB 前缀位操作，取指 / 译码 / 执行循环逐条手写，
-            Z / N / H / C 标志位逐一对齐——Blargg 指令考卷
-            <b style="color:var(--fg)">75/75</b> 全过。</p>
-          <div class="card-bottom">
-            <figure class="shot">
-              <img src="assets/img/exam.png" alt="Blargg 指令测试画面" loading="lazy" data-slot>
-              <figcaption class="slot-hint">等待放入截图<code>assets/img/exam.png</code></figcaption>
-            </figure>
-          </div>
-        </article>
-
-        <article class="tech-card reveal" data-od-id="tech-interrupt">
-          <p class="tag">INTERRUPT</p>
-          <h3>中断系统</h3>
-          <p>VBlank / LCD / Timer / Serial / Joypad 五个向量统一调度，
-            IME + IE/IF 精确控制——手柄按键、屏幕刷新的及时响应都由它保证。</p>
-          <div class="card-bottom">
-            <div class="reg" aria-label="中断相关寄存器速览">
-              <b>IE</b> @ $FFFF · <b>IF</b> @ $FF0F<br>
-              VBLANK · LCD · TIMER · SERIAL · JOYPAD<br>
-              中断向量 $40 – $60 · IME 开关
-            </div>
-          </div>
-        </article>
-
-        <article class="tech-card reveal" data-od-id="tech-timer">
-          <p class="tag">TIMER</p>
-          <h3>定时器</h3>
-          <p>DIV + TIMA/TMA/TAC：按 TAC 分频累加，溢出回装并请求中断——
-            游戏里的每一秒，都从这里来。</p>
-          <div class="card-bottom">
-            <div class="reg" aria-label="定时器相关寄存器速览">
-              <b>DIV</b> @ $FF04 · <b>TIMA</b> @ $FF05<br>
-              <b>TMA</b> @ $FF06 · <b>TAC</b> @ $FF07<br>
-              TAC 四档时钟 → 溢出 → TIMA 中断
-            </div>
-          </div>
-        </article>
-
-        <article class="tech-card reveal" data-od-id="tech-ppu">
-          <p class="tag">PPU</p>
-          <h3>图像处理器</h3>
-          <p>背景与精灵两层扫描线渲染，含 SCX/SCY 滚动、图块映射、
-            调色板与 OAM DMA，点亮 160×144——
-            经典 DMG 四阶绿，正是本站配色来源。</p>
-          <div class="card-bottom">
-            <figure class="shot">
-              <img src="assets/img/screenminesweep.png" alt="PPU 渲染的扫雷画面" loading="lazy" data-slot>
-              <figcaption class="slot-hint">等待放入截图<code>assets/img/screenminesweep.png</code></figcaption>
-            </figure>
-          </div>
-        </article>
-      </div>
-    </div>
-  </section>
-
-  <!-- ========== 学习路线 ========== -->
-  <section id="path" class="section" data-od-id="path">
-    <div class="container">
-      <header class="section-head reveal">
-        <p class="eyebrow">JOURNEY · 学习路线</p>
-        <h2>从 CHIP-8 到第一块砖</h2>
-        <p class="section-sub">从 CHIP-8 入门，再到 GB、GBC 和 GBA。每一站都接着上一站，解决一组新的硬件问题。</p>
-      </header>
-
-      <ol class="timeline">
-        <li class="tl-item reveal">
-          <span class="tl-node" aria-hidden="true"></span>
-          <span class="tl-tag">STAGE 01</span>
-          <h3>CHIP-8：第一个模拟器</h3>
-          <p>1977 年设计的入门虚拟机：35 条指令、64×32 单色屏。先用 Python 写通「取指 — 译码 — 执行」循环，跑通第一个模拟器。</p>
-        </li>
-        <li class="tl-item reveal">
-          <span class="tl-node" aria-hidden="true"></span>
-          <span class="tl-tag">STAGE 02</span>
-          <h3>学 Rust</h3>
-          <p>换一门系统级语言练手：所有权与借用检查逼你想清楚每一块内存的归属，match 把 opcode 映射成指令枚举——写模拟器内核的趁手工具。</p>
-        </li>
-        <li class="tl-item reveal">
-          <span class="tl-node" aria-hidden="true"></span>
-          <span class="tl-tag">STAGE 03</span>
-          <h3>Game Boy CPU</h3>
-          <p>LR35902（SM83）指令集逐条实现：A–L 八个 8 位寄存器、栈指针、程序计数器与内存总线一一对应，内核逐步成形。</p>
-        </li>
-        <li class="tl-item reveal">
-          <span class="tl-node" aria-hidden="true"></span>
-          <span class="tl-tag">STAGE 04</span>
-          <h3>Blargg 考卷：75/75</h3>
-          <p>社区公认的指令级考卷，从第一题做到 75/75 全部通过——核心逻辑拿到「合格证」，才敢往下接屏幕。</p>
-        </li>
-        <li class="tl-item reveal">
-          <span class="tl-node" aria-hidden="true"></span>
-          <span class="tl-tag">STAGE 05</span>
-          <h3>PPU 显像：第一块砖落下</h3>
-          <p>每帧 70,224 个时钟周期、每秒 59.7 帧的节奏，逐行画满 160×144——屏幕亮起那一刻，2048 的数字方块落在自己写的机器上。</p>
-        </li>
-        <li class="tl-item reveal">
-          <span class="tl-node" aria-hidden="true"></span>
-          <span class="tl-tag">STAGE 06</span>
-          <h3>Game Boy Color：从黑白到彩色</h3>
-          <p>加入彩色调色板、显存分区和双倍速。cgb-acid2 测试图与参考图逐像素一致。</p>
-        </li>
-        <li class="tl-item lit reveal">
-          <span class="tl-node" aria-hidden="true"></span>
-          <span class="tl-tag">STAGE 07</span>
-          <h3>Game Boy Advance：从指令到整机</h3>
-          <p>从 ARM 和 Thumb 指令起步，接入画面、声音和存档。现在用公开测试卡带检查显示芯片、CPU 和 DMA 同时访问显存时的行为。</p>
-        </li>
-      </ol>
-    </div>
-  </section>
+<section id="path" class="section" data-od-id="path"><div class="container">
+<header class="section-head reveal"><p class="eyebrow">JOURNEY · 学习与开发路线</p><h2>从第一条指令，到三代掌机。</h2><p class="section-sub">每一站解决一组新的硬件问题，再用测试检查结果。</p></header>
+<ol class="timeline"><li class="tl-item reveal"><span class="tl-node" aria-hidden="true"></span><span class="tl-tag">STAGE 01</span><h3>CHIP-8：取指循环的起点</h3><p>用 Python 实现取指、译码与执行，先弄清楚模拟器怎样工作。</p></li>
+<li class="tl-item reveal"><span class="tl-node" aria-hidden="true"></span><span class="tl-tag">STAGE 02</span><h3>Rust：把内核搭起来</h3><p>用所有权、借用和指令枚举组织处理器与内存总线。</p></li>
+<li class="tl-item reveal"><span class="tl-node" aria-hidden="true"></span><span class="tl-tag">STAGE 03</span><h3>GB CPU：逐条实现 SM83</h3><p>实现寄存器、栈、标志位、主指令与 CB 前缀指令。</p></li>
+<li class="tl-item reveal"><span class="tl-node" aria-hidden="true"></span><span class="tl-tag">STAGE 04</span><h3>Blargg：75/75</h3><p>让 CPU 逐条接受独立指令测试，再向画面与外设推进。</p></li>
+<li class="tl-item reveal"><span class="tl-node" aria-hidden="true"></span><span class="tl-tag">STAGE 05</span><h3>PPU / 音频 / MBC3/5</h3><p>接入逐周期画面、四声道音频、卡带换页与 RTC；Mealybug DMG 逐像素对比 24/24。</p></li>
+<li class="tl-item reveal"><span class="tl-node" aria-hidden="true"></span><span class="tl-tag">STAGE 06</span><h3>GBC：彩色与双倍速</h3><p>接入彩色图层、内存分区与显存 DMA，cgb-acid2 的 23,040 个像素与参考图一致。</p></li>
+<li class="tl-item reveal lit"><span class="tl-node" aria-hidden="true"></span><span class="tl-tag">STAGE 07</span><h3>GBA：ARM/Thumb 到整机</h3><p>接入画面、声音、DMA 与存档；最近一次整套回归通过 102 项，继续完善时序精度。</p></li></ol>
+<h3 class="next-title">NEXT · GBA 开发路线</h3><div class="machine-grid"><article class="tech-card reveal"><p class="tag">NEXT / 01</p><h3>画面时序</h3><p>继续验证精灵争用、行中改寄存器的生效时刻，以及真机与参考模型的差异。</p></article><article class="tech-card reveal"><p class="tag">NEXT / 02</p><h3>CPU 与内存</h3><p>按失败用例检查卡带预取、DMA 后重新取指与内存边界。</p></article><article class="tech-card reveal"><p class="tag">NEXT / 03</p><h3>整机与手机</h3><p>细化音频混音和 Flash 写入耗时，验证实际手机触控、声音与更多卡带的启动、游玩和读档。</p></article></div>
+<div class="terminal reveal"><p class="eyebrow">LOCAL · 本地运行与仓库文档</p><pre><code>cargo test --locked
+cargo run --release --locked -- path/to/game.gb
+cargo test --locked --manifest-path gba-cpu/Cargo.toml</code></pre><div class="doc-links"><a href="https://github.com/Leehomn/gb-emu/blob/master/POSTMORTEM.md">POSTMORTEM.md ↗</a><a href="https://github.com/Leehomn/gb-emu/blob/master/gba-cpu/README.md">gba-cpu/README.md ↗</a><a href="https://github.com/Leehomn/gb-emu/blob/master/gba-cpu/ROADMAP.md">gba-cpu/ROADMAP.md ↗</a></div></div>
+</div></section>
 </main>
 
 <footer class="site-footer" data-od-id="footer">
   <div class="container">
-    <p class="legal"><b>版权与 ROM 声明：</b>本站为个人作品展示，仅包含自制模拟器代码与自制 / 免费（homebrew）ROM，
+    <p class="legal"><b>版权与 ROM 声明：</b>本站为个人作品展示，仅包含自制模拟器代码与开源 / homebrew ROM，
       不提供、不传播任何商业游戏 ROM；商业 ROM 请自备，并请遵守所在地区的版权法律。</p>
     <p class="colophon">Rust 手写内核 · 纯静态站点 · 无后端 / 无数据库 / 无登录 · <a href="https://github.com/Leehomn/gb-emu" target="_blank" rel="noopener">GitHub 源码</a> · © <span id="year">2026</span> RustBoy</p>
     <p class="font-credit">像素字体 Press Start 2P · CodeMan38 · SIL Open Font License 1.1</p>
@@ -885,6 +819,72 @@ code{font-family:var(--font-pixel);letter-spacing:.04em;}
 
   if (btnStart) { btnStart.addEventListener('click', start); }
   if (btnRetry) { btnRetry.addEventListener('click', start); }
+})();
+</script>
+<script>
+/* 背景代码雨独立运行，不接入模拟器逻辑。 */
+(function () {
+  'use strict';
+  const canvas = document.getElementById('matrix-bg');
+  const button = document.getElementById('rain-toggle');
+  const ctx = canvas.getContext('2d');
+  if (!ctx) { button.hidden = true; return; }
+  const motion = window.matchMedia('(prefers-reduced-motion: reduce)');
+  const glyphs = 'ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ0123456789ABCDEF';
+  let enabled = true, raf = 0, last = 0, width = 0, height = 0, size = 18, drops = [];
+  try { enabled = localStorage.getItem('rustboy-matrix-rain') !== 'off'; } catch (_) { /* 隐私模式下使用默认值 */ }
+  function symbol() { return Math.random() < .003 ? ['LD', 'IRQ', 'DMA'][Math.floor(Math.random()*3)] : glyphs[Math.floor(Math.random()*glyphs.length)]; }
+  function paint(still) {
+    ctx.fillStyle = still ? '#07060f' : 'rgba(7,6,15,.09)';
+    ctx.fillRect(0, 0, width, height);
+    ctx.font = size + 'px ui-monospace, Consolas, monospace';
+    drops.forEach(function (drop, i) {
+      const x = i * size, y = drop.y;
+      if (still) {
+        for (let j = 1; j < 13; j++) {
+          ctx.fillStyle = 'rgba(0,255,136,' + (.34 * (1-j/13)) + ')';
+          ctx.fillText(symbol(), x, y-j*size);
+        }
+      }
+      ctx.fillStyle = i % 47 === 0 ? '#ff2ea6' : i % 29 === 0 ? '#00f0ff' : '#14f195';
+      ctx.fillText(symbol(), x, y-size);
+      ctx.fillStyle = i % 3 === 0 ? '#00f0ff' : '#d8fff4';
+      ctx.fillText(symbol(), x, y);
+      if (!still) { drop.y += size * drop.speed; if (drop.y > height + size*15 && Math.random() > .975) drop.y = -size; }
+    });
+  }
+  function tick(time) {
+    raf = 0;
+    if (!enabled || document.hidden || motion.matches) return;
+    if (time-last >= 50) { paint(false); last = time; }
+    raf = requestAnimationFrame(tick);
+  }
+  function sync() {
+    if (raf) { cancelAnimationFrame(raf); raf = 0; }
+    button.textContent = 'RAIN: ' + (enabled ? 'ON' : 'OFF');
+    button.setAttribute('aria-pressed', String(enabled));
+    canvas.hidden = !enabled;
+    if (enabled && !document.hidden) { if (motion.matches) paint(true); else raf = requestAnimationFrame(tick); }
+  }
+  function resize() {
+    width = window.innerWidth; height = window.innerHeight;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(width*dpr); canvas.height = Math.round(height*dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    size = width < 600 ? 20 : 18;
+    drops = Array.from({length: Math.ceil(width/size)}, function () { return { y: Math.random()*height, speed: .35+Math.random()*.65 }; });
+    ctx.clearRect(0, 0, width, height);
+    sync();
+  }
+  button.addEventListener('click', function () {
+    enabled = !enabled;
+    try { localStorage.setItem('rustboy-matrix-rain', enabled ? 'on' : 'off'); } catch (_) { /* 存储不可用时仍可切换 */ }
+    sync();
+  });
+  window.addEventListener('resize', resize);
+  document.addEventListener('visibilitychange', sync);
+  motion.addEventListener('change', sync);
+  resize();
 })();
 </script>
 </body>
